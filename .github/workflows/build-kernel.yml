@@ -104,9 +104,8 @@ jobs:
           set -euxo pipefail
           cd linux
           make -j$(nproc) bindeb-pkg \
-            KDEB_PKGVERSION="$(make -s kernelrelease)-1" \
-            DPKG_FLAGS=-d
-
+            KDEB_PKGVERSION="$(make -s kernelrelease)-1"
+            
       - name: Get kernel release
         id: krel
         run: |
