@@ -1,0 +1,181 @@
+# .github/workflows/build-kernel.yml
+name: Build Debian Cloud Linux Kernel
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-debian-kernel
+  cancel-in-progress: false
+
+env:
+  KERNEL_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  DEBIAN_CONFIG_URL: "https://salsa.debian.org/kernel-team/linux/-/raw/master/debian/config/amd64/config.cloud-amd64"
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl ca-certificates \
+            build-essential bc kmod cpio flex bison \
+            libncurses-dev libelf-dev libssl-dev dwarves \
+            lz4 zstd xz-utils rsync file \
+            fakeroot dpkg-dev debhelper
+
+      - name: Determine latest stable kernel version
+        id: version
+        run: |
+          set -euo pipefail
+          latest_tag="$(
+            git ls-remote --tags "$KERNEL_REPO" \
+              | awk '{print $2}' \
+              | sed 's#refs/tags/##' \
+              | grep -Ev '\^\{\}' \
+              | grep -Ev -- '-rc' \
+              | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          # Strict format assertion to prevent injection from malformed tags
+          if ! [[ "$latest_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected tag format: '$latest_tag'"
+            exit 1
+          fi
+
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "Latest stable kernel tag: $latest_tag"
+
+      - name: Clone stable kernel
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 --branch "${{ steps.version.outputs.tag }}" "$KERNEL_REPO" linux
+
+      - name: Configure kernel for cloud/VPS
+        run: |
+          set -euxo pipefail
+          cd linux
+
+          curl -fL "$DEBIAN_CONFIG_URL" -o .config || {
+            echo "::error::Failed to fetch Debian cloud config"
+            exit 1
+          }
+
+          make olddefconfig
+
+          echo "-cloud" > localversion-custom
+
+          # BBRv1
+          scripts/config --module TCP_CONG_BBR
+          scripts/config --enable TCP_CONG_ADVANCED
+          scripts/config --set-str DEFAULT_TCP_CONG cubic
+
+          # VPS essentials
+          scripts/config --enable VIRTIO_NET
+          scripts/config --enable VIRTIO_BLK
+          scripts/config --enable VIRTIO_PCI
+          scripts/config --enable VIRTIO_BALLOON
+          scripts/config --enable XEN_BLKDEV_FRONTEND
+          scripts/config --enable XEN_NETDEV_FRONTEND
+          scripts/config --enable BLK_DEV_INITRD
+
+          # Reduce size
+          scripts/config --disable DEBUG_INFO
+          scripts/config --disable DEBUG_INFO_DWARF5
+          scripts/config --enable DEBUG_INFO_NONE
+          scripts/config --disable MODULE_SIG
+          scripts/config --disable MODULE_SIG_ALL
+          scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+
+          make olddefconfig
+
+          # Post-olddefconfig assertions for critical options
+          grep -q "^CONFIG_TCP_CONG_BBR=m" .config || { echo "::error::BBR config missing"; exit 1; }
+          grep -q "^CONFIG_VIRTIO_NET=y\|^CONFIG_VIRTIO_NET=m" .config || { echo "::error::VIRTIO_NET missing"; exit 1; }
+          grep -q "^CONFIG_VIRTIO_BLK=y\|^CONFIG_VIRTIO_BLK=m" .config || { echo "::error::VIRTIO_BLK missing"; exit 1; }
+          grep -q "^CONFIG_VIRTIO_PCI=y\|^CONFIG_VIRTIO_PCI=m" .config || { echo "::error::VIRTIO_PCI missing"; exit 1; }
+
+          echo "=== Final config highlights ==="
+          grep -Ei "BBR|DEFAULT_TCP_CONG|VIRTIO" .config || true
+
+      - name: Build Debian kernel packages
+        run: |
+          set -euxo pipefail
+          cd linux
+          make -j"$(nproc)" bindeb-pkg \
+            KDEB_PKGVERSION="$(make -s kernelrelease)-1"
+
+      - name: Get kernel release
+        id: krel
+        run: |
+          set -euo pipefail
+          cd linux
+          echo "release=$(make -s kernelrelease)" >> "$GITHUB_OUTPUT"
+
+      - name: Collect and verify Debian packages
+        run: |
+          set -euxo pipefail
+          mkdir -p artifacts
+          find "$GITHUB_WORKSPACE" -maxdepth 1 -name "*.deb" -exec cp -v {} artifacts/ \;
+
+          ls -lh artifacts/
+          find artifacts -name "linux-image-*.deb" | grep -q . || \
+            { echo "::error::linux-image package missing"; exit 1; }
+
+      - name: Verify BBR module in image package
+        run: |
+          set -euxo pipefail
+          image_deb="$(find artifacts -name "linux-image-*.deb" | head -1)"
+          mkdir -p /tmp/img-check
+          dpkg-deb -x "$image_deb" /tmp/img-check
+
+          find /tmp/img-check/lib/modules -type f \( -name "tcp_bbr.ko" -o -name "tcp_bbr.ko.*" \) | grep -q . || \
+            { echo "::error::BBRv1 module missing"; exit 1; }
+
+      - name: Generate README
+        run: |
+          set -euo pipefail
+          kernel_release="${{ steps.krel.outputs.release }}"
+          build_date="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          cat > artifacts/README.md <<EOF
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        with:
+          name: debian-kernel-${{ steps.krel.outputs.release }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create Release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631  # v2.2.2
+        with:
+          tag_name: v${{ steps.krel.outputs.release }}-${{ github.run_number }}
+          name: "Debian Cloud Kernel ${{ steps.krel.outputs.release }}"
+          files: artifacts/*
+          body_path: artifacts/README.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
