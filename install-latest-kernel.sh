@@ -4,7 +4,7 @@ set -euo pipefail
 sudo apt update && sudo apt install -y curl jq
 
 # === 配置 ===
-REPO="你的用户名/auto-compile-latest-kernel-debian"
+REPO="Shouyupedia/auto-compile-latest-kernel-debian"
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
