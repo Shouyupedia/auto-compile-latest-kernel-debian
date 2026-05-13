@@ -41,7 +41,7 @@ jobs:
             build-essential bc kmod cpio flex bison \
             libncurses-dev libelf-dev libssl-dev dwarves \
             lz4 zstd xz-utils rsync file \
-            fakeroot dpkg-dev debhelper
+            fakeroot dpkg-dev debhelper libdw-dev
 
       - name: Determine latest stable kernel version
         id: version
