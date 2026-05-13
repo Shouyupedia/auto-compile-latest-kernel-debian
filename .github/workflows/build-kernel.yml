@@ -146,20 +146,7 @@ jobs:
             | Kernel Version | `$kernel_release` |
             | Build Date | $build_date |
             | Base Config | Debian cloud-amd64 |
-            ## Install
-            ```bash
-            sudo dpkg -i linux-image-*.deb linux-headers-*.deb
-            sudo reboot
-            Verify
-            Bash
-            uname -r
-            sysctl net.ipv4.tcp_available_congestion_control
-            Use BBRv1
-            Bash
-            sysctl -w net.ipv4.tcp_congestion_control=bbr
             EOF
-            
-            cat artifacts/README.md
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
         with:
