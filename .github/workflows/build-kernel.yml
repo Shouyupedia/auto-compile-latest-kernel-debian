@@ -103,12 +103,9 @@ jobs:
         run: |
           set -euxo pipefail
           cd linux
-          # Generate debian/ packaging files first
-          make -j$(nproc) bindeb-pkg KDEB_PKGVERSION="$(make -s kernelrelease)-1" || true
-          # Remove the :native qualifier that dpkg-checkbuilddeps can't resolve
-          sed -i 's/libdw-dev:native/libdw-dev/g' debian/control
-          # Now build for real
-          make -j$(nproc) bindeb-pkg KDEB_PKGVERSION="$(make -s kernelrelease)-1"
+          make -j$(nproc) bindeb-pkg \
+            KDEB_PKGVERSION="$(make -s kernelrelease)-1" \
+            DPKG_FLAGS=-d
 
       - name: Get kernel release
         id: krel
