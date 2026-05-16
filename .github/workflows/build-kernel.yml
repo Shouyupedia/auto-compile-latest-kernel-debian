@@ -1,5 +1,5 @@
 # .github/workflows/build-kernel.yml
-name: Build Debian Cloud Linux Kernel
+name: Build Debian Linux Kernel
 
 on:
   schedule:
@@ -15,7 +15,6 @@ concurrency:
 
 env:
   KERNEL_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
-  DEBIAN_CONFIG_URL: "https://salsa.debian.org/kernel-team/linux/-/raw/master/debian/config/amd64/config.cloud-amd64"
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
@@ -68,22 +67,12 @@ jobs:
           set -euxo pipefail
           git clone --depth=1 --branch "${{ steps.version.outputs.tag }}" "$KERNEL_REPO" linux
 
-      - name: Configure kernel for cloud/VPS
+      - name: Configure kernel
         run: |
           set -euxo pipefail
           cd linux
-          make defconfig
-          echo "-cloud" > localversion-custom
-          scripts/config --module TCP_CONG_BBR
-          scripts/config --enable TCP_CONG_ADVANCED
-          scripts/config --set-str DEFAULT_TCP_CONG cubic
-          scripts/config --enable VIRTIO_NET
-          scripts/config --enable VIRTIO_BLK
-          scripts/config --enable VIRTIO_PCI
-          scripts/config --enable VIRTIO_BALLOON
-          scripts/config --enable XEN_BLKDEV_FRONTEND
-          scripts/config --enable XEN_NETDEV_FRONTEND
-          scripts/config --enable BLK_DEV_INITRD
+
+          cp /boot/config-$(uname -r) .config
           scripts/config --disable DEBUG_INFO
           scripts/config --disable DEBUG_INFO_DWARF5
           scripts/config --enable DEBUG_INFO_NONE
@@ -91,13 +80,14 @@ jobs:
           scripts/config --disable MODULE_SIG_ALL
           scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
           scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+          scripts/config --module TCP_CONG_BBR
+          scripts/config --enable TCP_CONG_ADVANCED
+          scripts/config --set-str DEFAULT_TCP_CONG cubic
           make olddefconfig
+
           grep -q "^CONFIG_TCP_CONG_BBR=m" .config || { echo "::error::BBR config missing"; exit 1; }
           grep -qE "^CONFIG_VIRTIO_NET=(y|m)" .config || { echo "::error::VIRTIO_NET missing"; exit 1; }
           grep -qE "^CONFIG_VIRTIO_BLK=(y|m)" .config || { echo "::error::VIRTIO_BLK missing"; exit 1; }
-          grep -qE "^CONFIG_VIRTIO_PCI=(y|m)" .config || { echo "::error::VIRTIO_PCI missing"; exit 1; }
-          echo "=== Final config highlights ==="
-          grep -Ei "BBR|DEFAULT_TCP_CONG|VIRTIO" .config || true
 
       - name: Build kernel
         run: |
@@ -140,17 +130,17 @@ jobs:
           build_date="$(date -u '+%Y-%m-%d %H:%M UTC')"
           export kernel_release build_date
           envsubst '$kernel_release $build_date' > artifacts/README.md <<'EOF'
-            # Debian Cloud Kernel Build
+            # Debian Kernel Build
             | Item | Value |
             |------|-------|
             | Kernel Version | `$kernel_release` |
             | Build Date | $build_date |
-            | Base Config | Debian cloud-amd64 |
+            | Base Config | Debian amd64 |
             EOF
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
         with:
-          name: debian-kernel-${{ steps.krel.outputs.release }}
+          name: "Debian Kernel ${{ steps.krel.outputs.release }}"
           path: artifacts/*
           if-no-files-found: error
           retention-days: 14
@@ -159,7 +149,7 @@ jobs:
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631  # v2.2.2
         with:
           tag_name: v${{ steps.krel.outputs.release }}-${{ github.run_number }}
-          name: "Debian Cloud Kernel ${{ steps.krel.outputs.release }}"
+          name: "Debian Kernel ${{ steps.krel.outputs.release }}"
           files: artifacts/*
           body_path: artifacts/README.md
         env:
