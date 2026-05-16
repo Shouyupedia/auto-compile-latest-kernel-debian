@@ -136,7 +136,7 @@ jobs:
             | Kernel Version | `$kernel_release` |
             | Build Date | $build_date |
             | Base Config | Debian amd64 |
-            EOF
+          EOF
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
         with:
