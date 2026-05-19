@@ -153,17 +153,25 @@ jobs:
           ls -lh artifacts/
           find artifacts -name "linux-image-*.deb" | grep -q . || \
             { echo "::error::linux-image package missing"; exit 1; }
-
-      - name: Verify BBR module in image package
+      
+      - name: Verify BBR in image package
         run: |
           set -euxo pipefail
           image_deb="$(find artifacts -name "linux-image-*.deb" | head -1)"
           mkdir -p /tmp/img-check
           dpkg-deb -x "$image_deb" /tmp/img-check
-
-          find /tmp/img-check/lib/modules -type f \( -name "tcp_bbr.ko" -o -name "tcp_bbr.ko.*" \) | grep -q . || \
-            { echo "::error::BBRv1 module missing"; exit 1; }
-
+      
+          # 模块存在则通过（m）
+          if find /tmp/img-check/lib/modules -type f \( -name "tcp_bbr.ko" -o -name "tcp_bbr.ko.*" \) | grep -q .; then
+            echo "BBR module found"
+            exit 0
+          fi
+      
+          # 否则检查 config（y）
+          cfg="$(find /tmp/img-check/boot -type f -name "config-*" | head -1)"
+          grep -q '^CONFIG_TCP_CONG_BBR=y' "$cfg" || { echo "::error::BBR missing (neither module nor built-in)"; exit 1; }
+          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"' "$cfg" || { echo "::error::DEFAULT_TCP_CONG is not bbr"; exit 1; }
+          
       - name: Generate README
         run: |
           set -euo pipefail
