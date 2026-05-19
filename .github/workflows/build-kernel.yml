@@ -72,8 +72,8 @@ jobs:
         run: |
           set -euxo pipefail
           cd linux
-
-          cp /boot/config-$(uname -r) .config
+          make defconfig
+          
           scripts/config --disable DEBUG_INFO
           scripts/config --disable DEBUG_INFO_DWARF5
           scripts/config --enable DEBUG_INFO_NONE
@@ -81,14 +81,49 @@ jobs:
           scripts/config --disable MODULE_SIG_ALL
           scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
           scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
-          scripts/config --module TCP_CONG_BBR
           scripts/config --enable TCP_CONG_ADVANCED
-          scripts/config --set-str DEFAULT_TCP_CONG cubic
+          scripts/config --enable TCP_CONG_BBR
+          scripts/config --set-str DEFAULT_TCP_CONG bbr
+          scripts/config --set-val NR_CPUS 64
+          scripts/config --disable MAXSMP
+          scripts/config --disable SCHED_MC_PRIO
+          scripts/config --disable NUMA
+          scripts/config --disable NUMA_BALANCING
+          scripts/config --disable X86_5LEVEL
+          scripts/config --enable NO_HZ_IDLE
+          scripts/config --disable NO_HZ_FULL
+          scripts/config --enable HZ_250
+          scripts/config --disable HZ_1000
+          scripts/config --enable PREEMPT_VOLUNTARY
+          scripts/config --disable PREEMPT
+          scripts/config --enable HYPERVISOR_GUEST
+          scripts/config --enable PARAVIRT
+          scripts/config --enable PARAVIRT_SPINLOCKS
+          scripts/config --enable KVM_GUEST
+          scripts/config --enable PARAVIRT_CLOCK
+          scripts/config --enable VIRTIO
+          scripts/config --enable VIRTIO_PCI
+          scripts/config --enable VIRTIO_PCI_LEGACY
+          scripts/config --enable VIRTIO_BLK
+          scripts/config --enable VIRTIO_NET
+          scripts/config --module VIRTIO_CONSOLE
+          scripts/config --enable EXT4_FS
+          scripts/config --module XFS_FS
+          scripts/config --disable DRM
+          scripts/config --disable FB
+          scripts/config --disable LOGO
+          scripts/config --disable VGA_CONSOLE
+          scripts/config --enable SERIAL_8250_CONSOLE
           make olddefconfig
 
-          grep -q "^CONFIG_TCP_CONG_BBR=m" .config || { echo "::error::BBR config missing"; exit 1; }
+          grep -qE "^CONFIG_TCP_CONG_BBR=(y|m)" .config || { echo "::error::BBR missing"; exit 1; }
+          grep -q "^CONFIG_DEFAULT_TCP_CONG=\"bbr\"" .config || { echo "::error::DEFAULT_TCP_CONG is not bbr"; exit 1; }
           grep -qE "^CONFIG_VIRTIO_NET=(y|m)" .config || { echo "::error::VIRTIO_NET missing"; exit 1; }
           grep -qE "^CONFIG_VIRTIO_BLK=(y|m)" .config || { echo "::error::VIRTIO_BLK missing"; exit 1; }
+          grep -qE "^CONFIG_XFS_FS=(y|m)" .config || { echo "::error::XFS_FS missing"; exit 1; }
+          grep -q "^CONFIG_NR_CPUS=64" .config || { echo "::error::NR_CPUS is not 64"; exit 1; }
+          grep -q "^CONFIG_NO_HZ_IDLE=y" .config || { echo "::error::NO_HZ_IDLE missing"; exit 1; }
+          grep -q "^CONFIG_NO_HZ_FULL is not set" .config || true
 
       - name: Build kernel
         run: |
