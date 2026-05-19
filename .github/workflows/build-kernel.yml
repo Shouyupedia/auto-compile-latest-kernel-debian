@@ -83,6 +83,8 @@ jobs:
           scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
           scripts/config --enable TCP_CONG_ADVANCED
           scripts/config --enable TCP_CONG_BBR
+          scripts/config --enable DEFAULT_BBR
+          scripts/config --disable DEFAULT_CUBIC
           scripts/config --set-str DEFAULT_TCP_CONG bbr
           scripts/config --set-val NR_CPUS 64
           scripts/config --disable MAXSMP
@@ -116,8 +118,9 @@ jobs:
           scripts/config --enable SERIAL_8250_CONSOLE
           make olddefconfig
 
-          grep -qE "^CONFIG_TCP_CONG_BBR=(y|m)" .config || { echo "::error::BBR missing"; exit 1; }
-          grep -q "^CONFIG_DEFAULT_TCP_CONG=\"bbr\"" .config || { echo "::error::DEFAULT_TCP_CONG is not bbr"; exit 1; }
+          grep -qE '^CONFIG_TCP_CONG_BBR=(y|m)' .config || { echo "::error::BBR missing"; exit 1; }
+          grep -q '^CONFIG_DEFAULT_BBR=y' .config || { echo "::error::DEFAULT_BBR not selected"; exit 1; }
+          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"' .config || { echo "::error::DEFAULT_TCP_CONG is not bbr"; exit 1; }
           grep -qE "^CONFIG_VIRTIO_NET=(y|m)" .config || { echo "::error::VIRTIO_NET missing"; exit 1; }
           grep -qE "^CONFIG_VIRTIO_BLK=(y|m)" .config || { echo "::error::VIRTIO_BLK missing"; exit 1; }
           grep -qE "^CONFIG_XFS_FS=(y|m)" .config || { echo "::error::XFS_FS missing"; exit 1; }
