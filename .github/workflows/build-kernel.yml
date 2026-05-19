@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    - cron: "00 6 * * 1"
+    - cron: "28 10 * * 1"
 
 permissions:
   contents: write
@@ -29,7 +29,7 @@ jobs:
           set -euxo pipefail
           df -h
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+            /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
           df -h
 
       - name: Install build dependencies
@@ -132,7 +132,9 @@ jobs:
         run: |
           set -euxo pipefail
           cd linux
-          make -j$(nproc) bindeb-pkg \
+          make -j"$(nproc)" scripts
+          chmod +x scripts/basic/fixdep || true
+          make -j"$(nproc)" bindeb-pkg \
             KDEB_PKGVERSION="$(make -s kernelrelease)-1"
             
       - name: Get kernel release
