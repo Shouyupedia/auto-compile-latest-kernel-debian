@@ -134,8 +134,7 @@ jobs:
           cd /tmp/linux
           make -j"$(nproc)" scripts
           chmod +x scripts/basic/fixdep || true
-          make -j"$(nproc)" bindeb-pkg \
-            KDEB_PKGVERSION="$(make -s kernelrelease)-1"
+          fakeroot make -j"$(nproc)" deb-pkg KDEB_PKGVERSION="$(make -s kernelrelease)-1"
             
       - name: Get kernel release
         id: krel
