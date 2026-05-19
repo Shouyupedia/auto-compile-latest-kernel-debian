@@ -66,12 +66,12 @@ jobs:
       - name: Clone stable kernel
         run: |
           set -euxo pipefail
-          git clone --depth=1 --branch "${{ steps.version.outputs.tag }}" "$KERNEL_REPO" linux
+          git clone --depth=1 --branch "${{ steps.version.outputs.tag }}" "$KERNEL_REPO" /tmp/linux
 
       - name: Configure kernel
         run: |
           set -euxo pipefail
-          cd linux
+          cd /tmp/linux
           make defconfig
           
           scripts/config --disable DEBUG_INFO
@@ -131,7 +131,7 @@ jobs:
       - name: Build kernel
         run: |
           set -euxo pipefail
-          cd linux
+          cd /tmp/linux
           make -j"$(nproc)" scripts
           chmod +x scripts/basic/fixdep || true
           make -j"$(nproc)" bindeb-pkg \
@@ -141,7 +141,7 @@ jobs:
         id: krel
         run: |
           set -euo pipefail
-          cd linux
+          cd /tmp/linux
           echo "release=$(make -s kernelrelease)" >> "$GITHUB_OUTPUT"
 
       - name: Collect and verify Debian packages
@@ -178,8 +178,9 @@ jobs:
             | Build Date | $build_date |
             | Base Config | Debian amd64 |
           EOF
+          
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
+        uses: actions/upload-artifact@v4
         with:
           name: "Debian Kernel ${{ steps.krel.outputs.release }}"
           path: artifacts/*
@@ -187,7 +188,7 @@ jobs:
           retention-days: 14
 
       - name: Create Release
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631  # v2.2.2
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.krel.outputs.release }}-${{ github.run_number }}
           name: "Debian Kernel ${{ steps.krel.outputs.release }}"
