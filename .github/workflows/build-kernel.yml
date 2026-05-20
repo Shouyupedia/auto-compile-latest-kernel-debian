@@ -66,12 +66,21 @@ jobs:
         run: |
           set -euxo pipefail
           cd /tmp/linux
-
-          # 使用当前运行环境的发行版 config 作为基础，包含 Docker 所需的全部选项
+          # 基础：runner 的完整 config（已包含 Docker 所需全部选项）
           cp /boot/config-"$(uname -r)" .config
           make olddefconfig
-
-          # --- 精简调试信息，加速编译 ---
+          # 下载 Debian cloud 配置片段
+          DEBIAN_CFG_URL="https://salsa.debian.org/kernel-team/linux/-/raw/master/debian/config"
+          curl -fsSL "$DEBIAN_CFG_URL/config.cloud" -o /tmp/config.cloud
+          curl -fsSL "$DEBIAN_CFG_URL/kernelarch-x86/config.cloud-amd64" -o /tmp/config.cloud-amd64
+          # 将 Debian 片段格式转为标准 kconfig 格式（去掉 ##注释行）
+          grep -v '^##' /tmp/config.cloud > /tmp/frag.cloud || true
+          grep -v '^##' /tmp/config.cloud-amd64 > /tmp/frag.cloud-amd64 || true
+          # 用 merge_config 叠加片段（-m = merge mode，不重置未提及的选项）
+          scripts/kconfig/merge_config.sh -m .config \
+            /tmp/frag.cloud \
+            /tmp/frag.cloud-amd64
+          # 叠加你的自定义优化
           scripts/config --disable DEBUG_INFO
           scripts/config --disable DEBUG_INFO_DWARF5
           scripts/config --enable DEBUG_INFO_NONE
@@ -79,100 +88,47 @@ jobs:
           scripts/config --disable MODULE_SIG_ALL
           scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
           scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
-
-          # --- 网络优化: BBR ---
+          # BBR
           scripts/config --enable TCP_CONG_ADVANCED
           scripts/config --enable TCP_CONG_BBR
           scripts/config --enable DEFAULT_BBR
           scripts/config --disable DEFAULT_CUBIC
           scripts/config --set-str DEFAULT_TCP_CONG bbr
-
-          # --- 服务器场景优化 ---
+          # 服务器调优
           scripts/config --set-val NR_CPUS 64
-          scripts/config --disable MAXSMP
           scripts/config --enable NO_HZ_IDLE
-          scripts/config --disable NO_HZ_FULL
           scripts/config --enable HZ_250
           scripts/config --disable HZ_1000
           scripts/config --enable PREEMPT_VOLUNTARY
           scripts/config --disable PREEMPT
-
-          # --- 虚拟化支持 ---
-          scripts/config --enable HYPERVISOR_GUEST
-          scripts/config --enable PARAVIRT
-          scripts/config --enable PARAVIRT_SPINLOCKS
-          scripts/config --enable KVM_GUEST
-          scripts/config --enable PARAVIRT_CLOCK
-          scripts/config --enable VIRTIO
-          scripts/config --enable VIRTIO_PCI
-          scripts/config --enable VIRTIO_PCI_LEGACY
-          scripts/config --enable VIRTIO_BLK
-          scripts/config --enable VIRTIO_NET
-          scripts/config --module VIRTIO_CONSOLE
-
-          # --- 文件系统 ---
-          scripts/config --enable EXT4_FS
-          scripts/config --module XFS_FS
-          scripts/config --module OVERLAY_FS
-
-          # --- Docker/容器必需选项 ---
-          # cgroups
+          # 确保 Docker 关键选项不被 cloud 片段意外禁用
           scripts/config --enable CGROUPS
-          scripts/config --enable CGROUP_FREEZER
-          scripts/config --enable CGROUP_PIDS
-          scripts/config --enable CGROUP_DEVICE
-          scripts/config --enable CGROUP_CPUACCT
-          scripts/config --enable CGROUP_PERF
-          scripts/config --enable CGROUP_BPF
-          scripts/config --enable CPUSETS
-          scripts/config --enable MEMCG
-          scripts/config --enable BLK_CGROUP
-          scripts/config --enable CGROUP_SCHED
-          scripts/config --enable CGROUP_NET_PRIO
-
-          # namespaces
           scripts/config --enable NAMESPACES
           scripts/config --enable NET_NS
           scripts/config --enable PID_NS
           scripts/config --enable IPC_NS
           scripts/config --enable UTS_NS
           scripts/config --enable USER_NS
-
-          # networking for containers
+          scripts/config --enable MEMCG
+          scripts/config --enable CGROUP_PIDS
+          scripts/config --enable CGROUP_DEVICE
+          scripts/config --enable CGROUP_FREEZER
+          scripts/config --enable CPUSETS
+          scripts/config --enable BLK_CGROUP
           scripts/config --enable VETH
           scripts/config --enable BRIDGE
           scripts/config --enable BRIDGE_NETFILTER
-          scripts/config --enable NETFILTER_ADVANCED
           scripts/config --enable NETFILTER_XT_MATCH_CONNTRACK
           scripts/config --enable NETFILTER_XT_MATCH_ADDRTYPE
           scripts/config --enable NF_NAT
-          scripts/config --enable NF_NAT_MASQUERADE
           scripts/config --enable IP_NF_NAT
-          scripts/config --enable IP_NF_TARGET_MASQUERADE
           scripts/config --enable IP_NF_FILTER
           scripts/config --enable IP_NF_IPTABLES
-          scripts/config --enable IP_VS
-          scripts/config --enable IP_VS_NFCT
-          scripts/config --enable IP_VS_RR
-
-          # overlay filesystem (Docker default storage driver)
+          scripts/config --enable IP_NF_TARGET_MASQUERADE
           scripts/config --module OVERLAY_FS
-
-          # misc container requirements
-          scripts/config --enable POSIX_MQUEUE
-          scripts/config --enable KEYS
           scripts/config --enable SECCOMP
           scripts/config --enable SECCOMP_FILTER
-          scripts/config --enable DEVPTS_MULTIPLE_INSTANCES
-
-          # --- 禁用桌面相关 ---
-          scripts/config --disable DRM
-          scripts/config --disable FB
-          scripts/config --disable LOGO
-          scripts/config --disable VGA_CONSOLE
-          scripts/config --enable SERIAL_8250_CONSOLE
-
-          # 最终解决依赖
+          scripts/config --enable POSIX_MQUEUE
           make olddefconfig
 
           # --- 验证关键选项 ---
