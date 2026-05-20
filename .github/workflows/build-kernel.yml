@@ -69,14 +69,8 @@ jobs:
           # 基础：runner 的完整 config（已包含 Docker 所需全部选项）
           cp /boot/config-"$(uname -r)" .config
           make olddefconfig
-          # 下载 Debian cloud 配置片段
-          DEBIAN_CFG_URL="https://salsa.debian.org/kernel-team/linux/-/raw/master/debian/config"
-          curl -fsSL "$DEBIAN_CFG_URL/config.cloud" -o /tmp/config.cloud
-          curl -fsSL "$DEBIAN_CFG_URL/kernelarch-x86/config.cloud-amd64" -o /tmp/config.cloud-amd64
-          # 将 Debian 片段格式转为标准 kconfig 格式（去掉 ##注释行）
-          grep -v '^##' /tmp/config.cloud > /tmp/frag.cloud || true
-          grep -v '^##' /tmp/config.cloud-amd64 > /tmp/frag.cloud-amd64 || true
-          # 用 merge_config 叠加片段（-m = merge mode，不重置未提及的选项）
+          grep -v '^##' "$GITHUB_WORKSPACE/config.cloud" > /tmp/frag.cloud
+          grep -v '^##' "$GITHUB_WORKSPACE/config.cloud-amd64" > /tmp/frag.cloud-amd64
           scripts/kconfig/merge_config.sh -m .config \
             /tmp/frag.cloud \
             /tmp/frag.cloud-amd64
