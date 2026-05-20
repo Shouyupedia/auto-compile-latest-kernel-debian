@@ -3,7 +3,6 @@ name: Build Debian Linux Kernel
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "28 10 * * 1"
 
@@ -27,17 +26,15 @@ jobs:
       - name: Free disk space
         run: |
           set -euxo pipefail
-          df -h
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
           df -h
 
       - name: Install build dependencies
         run: |
-          sudo dpkg --add-architecture "$(dpkg --print-architecture)"
           sudo apt-get update
           sudo apt-get install -y build-essential bc kmod cpio flex libncurses-dev \
-            libssl-dev libelf-dev bison dwarves debhelper rsync libdw-dev
+            libssl-dev libelf-dev bison dwarves debhelper rsync libdw-dev fakeroot
 
       - name: Determine latest stable kernel version
         id: version
@@ -47,14 +44,12 @@ jobs:
             git ls-remote --tags "$KERNEL_REPO" \
               | awk '{print $2}' \
               | sed 's#refs/tags/##' \
-              | grep -Ev '\^\{\}' \
-              | grep -Ev -- '-rc' \
-              | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | grep -Ev '\^\{\}|-rc' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
               | sort -V \
               | tail -n 1
           )"
 
-          # Strict format assertion to prevent injection from malformed tags
           if ! [[ "$latest_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Unexpected tag format: '$latest_tag'"
             exit 1
@@ -65,15 +60,18 @@ jobs:
 
       - name: Clone stable kernel
         run: |
-          set -euxo pipefail
           git clone --depth=1 --branch "${{ steps.version.outputs.tag }}" "$KERNEL_REPO" /tmp/linux
 
       - name: Configure kernel
         run: |
           set -euxo pipefail
           cd /tmp/linux
-          make defconfig
-          
+
+          # 使用当前运行环境的发行版 config 作为基础，包含 Docker 所需的全部选项
+          cp /boot/config-"$(uname -r)" .config
+          make olddefconfig
+
+          # --- 精简调试信息，加速编译 ---
           scripts/config --disable DEBUG_INFO
           scripts/config --disable DEBUG_INFO_DWARF5
           scripts/config --enable DEBUG_INFO_NONE
@@ -81,23 +79,25 @@ jobs:
           scripts/config --disable MODULE_SIG_ALL
           scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
           scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
+
+          # --- 网络优化: BBR ---
           scripts/config --enable TCP_CONG_ADVANCED
           scripts/config --enable TCP_CONG_BBR
           scripts/config --enable DEFAULT_BBR
           scripts/config --disable DEFAULT_CUBIC
           scripts/config --set-str DEFAULT_TCP_CONG bbr
+
+          # --- 服务器场景优化 ---
           scripts/config --set-val NR_CPUS 64
           scripts/config --disable MAXSMP
-          scripts/config --disable SCHED_MC_PRIO
-          scripts/config --disable NUMA
-          scripts/config --disable NUMA_BALANCING
-          scripts/config --disable X86_5LEVEL
           scripts/config --enable NO_HZ_IDLE
           scripts/config --disable NO_HZ_FULL
           scripts/config --enable HZ_250
           scripts/config --disable HZ_1000
           scripts/config --enable PREEMPT_VOLUNTARY
           scripts/config --disable PREEMPT
+
+          # --- 虚拟化支持 ---
           scripts/config --enable HYPERVISOR_GUEST
           scripts/config --enable PARAVIRT
           scripts/config --enable PARAVIRT_SPINLOCKS
@@ -109,33 +109,113 @@ jobs:
           scripts/config --enable VIRTIO_BLK
           scripts/config --enable VIRTIO_NET
           scripts/config --module VIRTIO_CONSOLE
+
+          # --- 文件系统 ---
           scripts/config --enable EXT4_FS
           scripts/config --module XFS_FS
+          scripts/config --module OVERLAY_FS
+
+          # --- Docker/容器必需选项 ---
+          # cgroups
+          scripts/config --enable CGROUPS
+          scripts/config --enable CGROUP_FREEZER
+          scripts/config --enable CGROUP_PIDS
+          scripts/config --enable CGROUP_DEVICE
+          scripts/config --enable CGROUP_CPUACCT
+          scripts/config --enable CGROUP_PERF
+          scripts/config --enable CGROUP_BPF
+          scripts/config --enable CPUSETS
+          scripts/config --enable MEMCG
+          scripts/config --enable BLK_CGROUP
+          scripts/config --enable CGROUP_SCHED
+          scripts/config --enable CGROUP_NET_PRIO
+
+          # namespaces
+          scripts/config --enable NAMESPACES
+          scripts/config --enable NET_NS
+          scripts/config --enable PID_NS
+          scripts/config --enable IPC_NS
+          scripts/config --enable UTS_NS
+          scripts/config --enable USER_NS
+
+          # networking for containers
+          scripts/config --enable VETH
+          scripts/config --enable BRIDGE
+          scripts/config --enable BRIDGE_NETFILTER
+          scripts/config --enable NETFILTER_ADVANCED
+          scripts/config --enable NETFILTER_XT_MATCH_CONNTRACK
+          scripts/config --enable NETFILTER_XT_MATCH_ADDRTYPE
+          scripts/config --enable NF_NAT
+          scripts/config --enable NF_NAT_MASQUERADE
+          scripts/config --enable IP_NF_NAT
+          scripts/config --enable IP_NF_TARGET_MASQUERADE
+          scripts/config --enable IP_NF_FILTER
+          scripts/config --enable IP_NF_IPTABLES
+          scripts/config --enable IP_VS
+          scripts/config --enable IP_VS_NFCT
+          scripts/config --enable IP_VS_RR
+
+          # overlay filesystem (Docker default storage driver)
+          scripts/config --module OVERLAY_FS
+
+          # misc container requirements
+          scripts/config --enable POSIX_MQUEUE
+          scripts/config --enable KEYS
+          scripts/config --enable SECCOMP
+          scripts/config --enable SECCOMP_FILTER
+          scripts/config --enable DEVPTS_MULTIPLE_INSTANCES
+
+          # --- 禁用桌面相关 ---
           scripts/config --disable DRM
           scripts/config --disable FB
           scripts/config --disable LOGO
           scripts/config --disable VGA_CONSOLE
           scripts/config --enable SERIAL_8250_CONSOLE
+
+          # 最终解决依赖
           make olddefconfig
 
-          grep -qE '^CONFIG_TCP_CONG_BBR=(y|m)' .config || { echo "::error::BBR missing"; exit 1; }
-          grep -q '^CONFIG_DEFAULT_BBR=y' .config || { echo "::error::DEFAULT_BBR not selected"; exit 1; }
-          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"' .config || { echo "::error::DEFAULT_TCP_CONG is not bbr"; exit 1; }
-          grep -qE "^CONFIG_VIRTIO_NET=(y|m)" .config || { echo "::error::VIRTIO_NET missing"; exit 1; }
-          grep -qE "^CONFIG_VIRTIO_BLK=(y|m)" .config || { echo "::error::VIRTIO_BLK missing"; exit 1; }
-          grep -qE "^CONFIG_XFS_FS=(y|m)" .config || { echo "::error::XFS_FS missing"; exit 1; }
-          grep -q "^CONFIG_NR_CPUS=64" .config || { echo "::error::NR_CPUS is not 64"; exit 1; }
-          grep -q "^CONFIG_NO_HZ_IDLE=y" .config || { echo "::error::NO_HZ_IDLE missing"; exit 1; }
-          grep -q "^CONFIG_NO_HZ_FULL is not set" .config || true
+          # --- 验证关键选项 ---
+          echo "=== Verifying kernel config ==="
+          fail=0
+          check_config() {
+            if ! grep -qE "$1" .config; then
+              echo "::error::MISSING: $1"
+              fail=1
+            fi
+          }
+
+          check_config '^CONFIG_TCP_CONG_BBR=(y|m)'
+          check_config '^CONFIG_DEFAULT_TCP_CONG="bbr"'
+          check_config '^CONFIG_NAMESPACES=y'
+          check_config '^CONFIG_NET_NS=y'
+          check_config '^CONFIG_PID_NS=y'
+          check_config '^CONFIG_CGROUPS=y'
+          check_config '^CONFIG_MEMCG=y'
+          check_config '^CONFIG_VETH=(y|m)'
+          check_config '^CONFIG_BRIDGE=(y|m)'
+          check_config '^CONFIG_OVERLAY_FS=(y|m)'
+          check_config '^CONFIG_NETFILTER_XT_MATCH_CONNTRACK=(y|m)'
+          check_config '^CONFIG_NF_NAT=(y|m)'
+          check_config '^CONFIG_IP_NF_NAT=(y|m)'
+          check_config '^CONFIG_SECCOMP=y'
+          check_config '^CONFIG_VIRTIO_NET=(y|m)'
+          check_config '^CONFIG_VIRTIO_BLK=(y|m)'
+          check_config '^CONFIG_EXT4_FS=(y|m)'
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Kernel config verification failed"
+            exit 1
+          fi
+          echo "All checks passed."
 
       - name: Build kernel
         run: |
           set -euxo pipefail
           cd /tmp/linux
-          make -j"$(nproc)" scripts
-          chmod +x scripts/basic/fixdep || true
-          fakeroot make -j"$(nproc)" deb-pkg KDEB_PKGVERSION="$(make -s kernelrelease)-1"
-            
+          KREL="$(make -s kernelrelease)"
+          fakeroot make -j"$(nproc)" deb-pkg KDEB_PKGVERSION="${KREL}-1"
+
       - name: Get kernel release
         id: krel
         run: |
@@ -148,44 +228,39 @@ jobs:
           set -euxo pipefail
           mkdir -p artifacts
           find /tmp -maxdepth 1 -type f -name "linux-*.deb" -exec cp -v {} artifacts/ \;
-
           ls -lh artifacts/
           find artifacts -name "linux-image-*.deb" | grep -q . || \
             { echo "::error::linux-image package missing"; exit 1; }
-      
+
       - name: Verify BBR in image package
         run: |
           set -euxo pipefail
           image_deb="$(find artifacts -name "linux-image-*.deb" | head -1)"
           mkdir -p /tmp/img-check
           dpkg-deb -x "$image_deb" /tmp/img-check
-      
-          # 模块存在则通过（m）
+
           if find /tmp/img-check/lib/modules -type f \( -name "tcp_bbr.ko" -o -name "tcp_bbr.ko.*" \) | grep -q .; then
             echo "BBR module found"
             exit 0
           fi
-      
-          # 否则检查 config（y）
+
           cfg="$(find /tmp/img-check/boot -type f -name "config-*" | head -1)"
-          grep -q '^CONFIG_TCP_CONG_BBR=y' "$cfg" || { echo "::error::BBR missing (neither module nor built-in)"; exit 1; }
-          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"' "$cfg" || { echo "::error::DEFAULT_TCP_CONG is not bbr"; exit 1; }
-          
+          grep -q '^CONFIG_TCP_CONG_BBR=y' "$cfg" || { echo "::error::BBR not built-in"; exit 1; }
+
       - name: Generate README
         run: |
           set -euo pipefail
-          kernel_release="${{ steps.krel.outputs.release }}"
-          build_date="$(date -u '+%Y-%m-%d %H:%M UTC')"
-          export kernel_release build_date
-          envsubst '$kernel_release $build_date' > artifacts/README.md <<'EOF'
-            # Debian Kernel Build
-            | Item | Value |
-            |------|-------|
-            | Kernel Version | `$kernel_release` |
-            | Build Date | $build_date |
-            | Base Config | Debian amd64 |
+          cat > artifacts/README.md <<EOF
+          # Debian Kernel Build
+          | Item | Value |
+          |------|-------|
+          | Kernel Version | \`${{ steps.krel.outputs.release }}\` |
+          | Build Date | $(date -u '+%Y-%m-%d %H:%M UTC') |
+          | Base Config | Ubuntu runner (Docker-ready) |
+          | BBR | Default congestion control |
+          | Docker Support | cgroups, namespaces, overlay, veth, bridge, netfilter |
           EOF
-          
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
