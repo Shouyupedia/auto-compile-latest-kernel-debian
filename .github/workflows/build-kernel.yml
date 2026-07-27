@@ -140,8 +140,10 @@ jobs:
             /tmp/frag.cloud \
             /tmp/frag.cloud-amd64
 
-          # Identify this build in uname, package names, and /boot filenames.
-          scripts/config --set-str LOCALVERSION "-shouyu"
+          # A localversion file is consumed by every Kbuild invocation,
+          # including the recursive make calls used by deb-pkg.
+          printf '%s\n' '-shouyu' > localversion-shouyu
+          scripts/config --set-str LOCALVERSION ""
           scripts/config --disable LOCALVERSION_AUTO
 
           # Custom size and signing settings.
@@ -207,8 +209,12 @@ jobs:
             fi
           }
 
-          check_config '^CONFIG_LOCALVERSION="-shouyu"$'
+          check_config '^CONFIG_LOCALVERSION=""$'
           check_config '^# CONFIG_LOCALVERSION_AUTO is not set$'
+          [[ "$(cat localversion-shouyu)" == "-shouyu" ]] || {
+            echo "::error::localversion-shouyu is invalid"
+            fail=1
+          }
           check_config '^CONFIG_TCP_CONG_BBR=(y|m)'
           check_config '^CONFIG_DEFAULT_TCP_CONG="bbr"'
           check_config '^CONFIG_NAMESPACES=y'
