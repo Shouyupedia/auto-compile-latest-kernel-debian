@@ -1,1 +1,13 @@
-# auto-compile-latest-kernel-debian
+# Debian stable kernel auto-build
+
+该项目每周检查 Linux stable 的最新正式版本：
+
+- 上游源码版本没有变化时，工作流会直接结束，不安装依赖、不编译，也不重复创建 Release。
+- 新内核使用 `-shouyu` 本地版本后缀，例如 `7.1.4-shouyu`。
+- Release 只发布启动所需的内核镜像和配套头文件，不会替换系统的 `linux-libc-dev`。
+
+## 安装
+
+运行 `install-latest-kernel.sh` 会安装最新 Release，并删除本项目安装的旧第三方内核。当前正在运行的内核始终保留，Debian/Ubuntu 官方内核也不会被删除。
+
+重启进入新内核后，如果安装时保留了正在运行的旧内核，可再次运行脚本完成清理。
