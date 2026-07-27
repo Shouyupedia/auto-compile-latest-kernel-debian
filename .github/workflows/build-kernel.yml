@@ -14,20 +14,122 @@ concurrency:
 
 env:
   KERNEL_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  DEBIAN_CONFIG_REPO: https://salsa.debian.org/kernel-team/linux.git
+  DEBIAN_CONFIG_REF: debian/latest
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
   check:
-    name: Check for a new stable kernel
+    name: Sync configs and check kernel source
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     outputs:
+      config_commit: ${{ steps.configs.outputs.config_commit }}
+      configs_changed: ${{ steps.configs.outputs.configs_changed }}
       release_tag: ${{ steps.version.outputs.release_tag }}
       should_build: ${{ steps.version.outputs.should_build }}
       source_tag: ${{ steps.version.outputs.source_tag }}
       version: ${{ steps.version.outputs.version }}
 
     steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Fetch and update Debian cloud configs
+        id: configs
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          config_repo=/tmp/debian-kernel-config
+
+          git clone \
+            --depth=1 \
+            --filter=blob:none \
+            --sparse \
+            --single-branch \
+            --branch "$DEBIAN_CONFIG_REF" \
+            "$DEBIAN_CONFIG_REPO" \
+            "$config_repo"
+          git -C "$config_repo" sparse-checkout set --no-cone \
+            /debian/config/config.cloud \
+            /debian/config/amd64/config.cloud-amd64
+
+          common_config="$config_repo/debian/config/config.cloud"
+          amd64_config="$config_repo/debian/config/amd64/config.cloud-amd64"
+
+          validate_fragment() {
+            local file="$1"
+            local name="$2"
+            local minimum_bytes="$3"
+            local minimum_settings="$4"
+            local bytes
+            local settings
+
+            if [[ ! -s "$file" ]]; then
+              echo "::error::$name is missing or empty"
+              return 1
+            fi
+
+            bytes="$(wc -c < "$file")"
+            settings="$(
+              grep -Ec '^(CONFIG_[A-Z0-9_]+=|# CONFIG_[A-Z0-9_]+ is not set$)' \
+                "$file" || true
+            )"
+
+            if ((bytes < minimum_bytes || settings < minimum_settings)); then
+              echo "::error::$name failed validation: ${bytes} bytes, ${settings} settings"
+              return 1
+            fi
+          }
+
+          validate_fragment "$common_config" config.cloud 10000 100
+          validate_fragment "$amd64_config" config.cloud-amd64 500 10
+
+          install -m 0644 "$common_config" "$GITHUB_WORKSPACE/config.cloud"
+          install -m 0644 "$amd64_config" "$GITHUB_WORKSPACE/config.cloud-amd64"
+
+          config_commit="$(git -C "$config_repo" rev-parse HEAD)"
+          configs_changed=false
+          if ! git diff --quiet -- config.cloud config.cloud-amd64; then
+            configs_changed=true
+            git diff --stat -- config.cloud config.cloud-amd64
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add config.cloud config.cloud-amd64
+            git commit -m "chore: update Debian cloud kernel configs [skip ci]"
+            git push origin "HEAD:${DEFAULT_BRANCH}"
+          else
+            echo "Debian cloud configs are already up to date."
+          fi
+
+          {
+            echo "config_commit=$config_commit"
+            echo "configs_changed=$configs_changed"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Debian cloud config sync"
+            echo
+            echo "- Source ref: \`$DEBIAN_CONFIG_REF\`"
+            echo "- Source commit: \`$config_commit\`"
+            echo "- Repository files changed: \`$configs_changed\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload cloud config snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-configs-${{ github.run_id }}
+          path: |
+            config.cloud
+            config.cloud-amd64
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Determine whether the kernel source changed
         id: version
         env:
@@ -119,8 +221,11 @@ jobs:
           sudo apt-get install -y build-essential bc kmod cpio flex libncurses-dev \
             libssl-dev libelf-dev bison dwarves debhelper rsync libdw-dev fakeroot
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Download current cloud config snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-configs-${{ github.run_id }}
+          path: ${{ github.workspace }}
 
       - name: Clone stable kernel
         run: |
@@ -302,6 +407,7 @@ jobs:
           |------|-------|
           | Kernel Version | \`${{ steps.krel.outputs.release }}\` |
           | Upstream Source | \`${{ needs.check.outputs.source_tag }}\` |
+          | Debian Config Source | \`${{ needs.check.outputs.config_commit }}\` |
           | Build Date | $(date -u '+%Y-%m-%d %H:%M UTC') |
           | Base Config | Ubuntu runner (Docker-ready) |
           | BBR | Default congestion control |
