@@ -3,7 +3,7 @@ name: Build Debian Linux Kernel
 on:
   workflow_dispatch:
   schedule:
-    - cron: "28 10 * * 1"
+    - cron: "28 10 * * *"
 
 permissions:
   contents: read
@@ -14,6 +14,7 @@ concurrency:
 
 env:
   KERNEL_REPO: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+  BBR3_REPO: https://github.com/CachyOS/linux.git
   DEBIAN_CONFIG_REPO: https://salsa.debian.org/kernel-team/linux.git
   DEBIAN_CONFIG_REF: debian/latest
   DEBIAN_FRONTEND: noninteractive
@@ -21,21 +22,27 @@ env:
 jobs:
   check:
     name: Sync configs and check kernel source
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     outputs:
+      bbr3_branch: ${{ steps.bbr3-source.outputs.branch }}
+      bbr3_tip: ${{ steps.bbr3-source.outputs.tip }}
       config_commit: ${{ steps.configs.outputs.config_commit }}
       configs_changed: ${{ steps.configs.outputs.configs_changed }}
+      existing_kernel_release: ${{ steps.version.outputs.existing_kernel_release }}
+      existing_release_tag: ${{ steps.version.outputs.existing_release_tag }}
       release_tag: ${{ steps.version.outputs.release_tag }}
+      release_target: ${{ steps.configs.outputs.release_target }}
       should_build: ${{ steps.version.outputs.should_build }}
+      source_commit: ${{ steps.version.outputs.source_commit }}
       source_tag: ${{ steps.version.outputs.source_tag }}
       version: ${{ steps.version.outputs.version }}
 
     steps:
       - name: Checkout default branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.repository.default_branch }}
 
@@ -56,11 +63,16 @@ jobs:
             "$DEBIAN_CONFIG_REPO" \
             "$config_repo"
           git -C "$config_repo" sparse-checkout set --no-cone \
+            /debian/config/config \
+            /debian/config/amd64/config \
             /debian/config/config.cloud \
             /debian/config/amd64/config.cloud-amd64
 
+          base_config="$config_repo/debian/config/config"
+          amd64_base_config="$config_repo/debian/config/amd64/config"
           common_config="$config_repo/debian/config/config.cloud"
           amd64_config="$config_repo/debian/config/amd64/config.cloud-amd64"
+          snapshot_dir="$RUNNER_TEMP/kernel-configs"
 
           validate_fragment() {
             local file="$1"
@@ -87,8 +99,17 @@ jobs:
             fi
           }
 
+          validate_fragment "$base_config" config 10000 100
+          validate_fragment "$amd64_base_config" config.amd64 500 5
           validate_fragment "$common_config" config.cloud 10000 100
           validate_fragment "$amd64_config" config.cloud-amd64 500 10
+
+          mkdir -p "$snapshot_dir"
+          install -m 0644 "$base_config" "$snapshot_dir/config.debian"
+          install -m 0644 "$amd64_base_config" "$snapshot_dir/config.amd64"
+          install -m 0644 "$common_config" "$snapshot_dir/config.cloud"
+          install -m 0644 "$amd64_config" "$snapshot_dir/config.cloud-amd64"
+          install -m 0644 "$GITHUB_WORKSPACE/config.vps" "$snapshot_dir/config.vps"
 
           install -m 0644 "$common_config" "$GITHUB_WORKSPACE/config.cloud"
           install -m 0644 "$amd64_config" "$GITHUB_WORKSPACE/config.cloud-amd64"
@@ -110,6 +131,7 @@ jobs:
           {
             echo "config_commit=$config_commit"
             echo "configs_changed=$configs_changed"
+            echo "release_target=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -119,16 +141,6 @@ jobs:
             echo "- Source commit: \`$config_commit\`"
             echo "- Repository files changed: \`$configs_changed\`"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload cloud config snapshot
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloud-configs-${{ github.run_id }}
-          path: |
-            config.cloud
-            config.cloud-amd64
-          if-no-files-found: error
-          retention-days: 1
 
       - name: Determine whether the kernel source changed
         id: version
@@ -151,29 +163,108 @@ jobs:
             exit 1
           fi
 
+          source_commit="$(
+            git ls-remote "$KERNEL_REPO" \
+              "refs/tags/${latest_tag}" \
+              "refs/tags/${latest_tag}^{}" \
+              | awk '
+                  /\^\{\}$/ { print $1; found=1; exit }
+                  { fallback=$1 }
+                  END { if (!found && fallback) print fallback }
+                '
+          )"
+          if ! [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve source commit for $latest_tag"
+            exit 1
+          fi
+
           version="${latest_tag#v}"
           release_tag="v${version}-shouyu"
-          published_tags="$(
-            gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq '.[].tag_name'
-          )"
           existing_release=""
+          existing_kernel_release=""
+          declare -A candidate_releases=()
+          declare -A candidate_kernel_releases=()
+          declare -A release_images=()
+          declare -A release_headers=()
+          declare -a candidate_order=()
 
-          while IFS= read -r published_tag; do
-            if [[ "$published_tag" == "$release_tag" || "$published_tag" == "$latest_tag" ]]; then
-              existing_release="$published_tag"
-              break
-            fi
+          release_assets_file="$RUNNER_TEMP/release-assets.tsv"
+          if ! gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '
+              .[]
+              | select(.draft == false and .prerelease == false)
+              | .tag_name as $tag
+              | (
+                  [$tag, ""]
+                  | @tsv
+                ),
+                (
+                  .assets[]?
+                  | select(.state == "uploaded")
+                  | [$tag, .name]
+                  | @tsv
+                )
+            ' > "$release_assets_file"; then
+            echo "::error::Could not query existing Releases"
+            exit 1
+          fi
 
-            # The old workflow produced tags such as v7.1.4-30 and
-            # v7.0.6-cloud-5.
-            if [[ "$published_tag" =~ ^v([0-9]+\.[0-9]+(\.[0-9]+)?)(-cloud)?-[0-9]+$ ]] \
+          while IFS=$'\t' read -r published_tag asset_name; do
+            matches_source=false
+            package_release=""
+
+            if [[ "$published_tag" == "$release_tag" ]]; then
+              matches_source=true
+              package_release="${version}-shouyu"
+            elif [[ "$published_tag" == "$latest_tag" ]]; then
+              matches_source=true
+              package_release="$version"
+            elif [[ "$published_tag" =~ ^v([0-9]+\.[0-9]+(\.[0-9]+)?)(-(shouyu|cloud))?-[0-9]+$ ]] \
               && [[ "${BASH_REMATCH[1]}" == "$version" ]]; then
-              existing_release="$published_tag"
-              break
+              matches_source=true
+              package_release="$version${BASH_REMATCH[3]}"
             fi
-          done <<< "$published_tags"
+
+            [[ "$matches_source" == true ]] || continue
+            if [[ ! ${candidate_releases["$published_tag"]+present} ]]; then
+              candidate_order+=("$published_tag")
+            fi
+            candidate_releases["$published_tag"]=1
+            candidate_kernel_releases["$published_tag"]="$package_release"
+            if [[ "$asset_name" == \
+              "linux-image-${package_release}_${package_release}-1_amd64.deb" ]]; then
+              release_images["$published_tag"]=1
+            elif [[ "$asset_name" == \
+              "linux-headers-${package_release}_${package_release}-1_amd64.deb" ]]; then
+              release_headers["$published_tag"]=1
+            fi
+          done < "$release_assets_file"
+
+          complete_release() {
+            local candidate="$1"
+            [[ ${release_images["$candidate"]+present} \
+              && ${release_headers["$candidate"]+present} ]]
+          }
+
+          if [[ ${candidate_releases["$release_tag"]+present} ]]; then
+            if complete_release "$release_tag"; then
+              existing_release="$release_tag"
+            fi
+          elif complete_release "$latest_tag"; then
+            existing_release="$latest_tag"
+          else
+            for published_tag in "${candidate_order[@]}"; do
+              if complete_release "$published_tag"; then
+                existing_release="$published_tag"
+                break
+              fi
+            done
+          fi
+
+          if [[ -n "$existing_release" ]]; then
+            existing_kernel_release="${candidate_kernel_releases[$existing_release]}"
+          fi
 
           should_build=true
           if [[ -n "$existing_release" ]]; then
@@ -185,8 +276,11 @@ jobs:
 
           {
             echo "source_tag=$latest_tag"
+            echo "source_commit=$source_commit"
             echo "version=$version"
             echo "release_tag=$release_tag"
+            echo "existing_release_tag=$existing_release"
+            echo "existing_kernel_release=$existing_kernel_release"
             echo "should_build=$should_build"
           } >> "$GITHUB_OUTPUT"
 
@@ -194,149 +288,668 @@ jobs:
             echo "### Kernel source check"
             echo
             echo "- Latest stable source: \`$latest_tag\`"
-            echo "- Release tag: \`$release_tag\`"
+            echo "- Source commit: \`$source_commit\`"
+            echo "- New Release tag: \`$release_tag\`"
+            echo "- Existing complete Release: \`${existing_release:-none}\`"
             echo "- Build required: \`$should_build\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve BBRv3 source
+        id: bbr3-source
+        if: steps.version.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          kernel_series="$(cut -d. -f1,2 <<< "${{ steps.version.outputs.version }}")"
+          branch="${kernel_series}/bbr3"
+          tip="$(
+            git ls-remote --heads "$BBR3_REPO" "refs/heads/$branch" \
+              | awk 'NR == 1 { print $1 }'
+          )"
+
+          if ! [[ "$tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::BBRv3 branch not found: $branch"
+            exit 1
+          fi
+
+          {
+            echo "branch=$branch"
+            echo "tip=$tip"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload kernel config snapshot
+        if: steps.version.outputs.should_build == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kernel-configs-${{ github.run_id }}
+          path: ${{ runner.temp }}/kernel-configs/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  repair-existing-release:
+    name: Normalize existing Release
+    needs: check
+    if: needs.check.outputs.should_build == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Normalize metadata and assets without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_RELEASE: ${{ needs.check.outputs.existing_kernel_release }}
+          RELEASE_TAG: ${{ needs.check.outputs.existing_release_tag }}
+        run: |
+          set -euo pipefail
+
+          valid_identity=false
+          if [[ "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-(shouyu|cloud))?$ \
+            && "$RELEASE_TAG" == "v${KERNEL_RELEASE}" ]]; then
+            valid_identity=true
+          elif [[ "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+(\.[0-9]+)?)(-(shouyu|cloud))?-[0-9]+$ ]]; then
+            legacy_release="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+            [[ "$KERNEL_RELEASE" == "$legacy_release" ]] \
+              && valid_identity=true
+          fi
+          if [[ "$valid_identity" != true ]]; then
+            echo "::error::Unsafe existing Release identity"
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/existing-release.json"
+          if ! gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            > "$release_json"; then
+            echo "::error::Could not read existing Release $RELEASE_TAG"
+            exit 1
+          fi
+          if ! jq -e '
+            .draft == false
+            and .prerelease == false
+            and (.id | type == "number")
+          ' "$release_json" >/dev/null; then
+            echo "::error::Existing Release is not a published final Release"
+            exit 1
+          fi
+          release_id="$(jq -er '.id' "$release_json")"
+
+          assets_file="$RUNNER_TEMP/existing-assets.tsv"
+          if ! gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+            --jq '
+              .[]
+              | [
+                  (.id | tostring),
+                  .name,
+                  .state,
+                  (.digest // ""),
+                  (.size | tostring),
+                  .created_at
+                ]
+              | @tsv
+            ' > "$assets_file"; then
+            echo "::error::Could not read existing Release assets"
+            exit 1
+          fi
+
+          declare -A asset_id=()
+          declare -A asset_name=()
+          declare -A asset_digest=()
+          declare -A asset_size=()
+          declare -A asset_created=()
+          declare -a extra_asset_ids=()
+
+          while IFS=$'\t' read -r id name state digest size created_at; do
+            kind=""
+            case "$name" in
+              "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
+                kind=image
+                ;;
+              "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
+                kind=headers
+                ;;
+              *)
+                extra_asset_ids+=("$id")
+                continue
+                ;;
+            esac
+
+            if [[ "$state" != "uploaded" \
+              || ! "$name" =~ ^linux-(image|headers)-[A-Za-z0-9.+~-]+_[A-Za-z0-9.+:~-]+_amd64\.deb$ \
+              || ! "$size" =~ ^[1-9][0-9]*$ \
+              || ${asset_id["$kind"]+present} ]]; then
+              echo "::error::Invalid or duplicate $kind asset in $RELEASE_TAG"
+              exit 1
+            fi
+            asset_id["$kind"]="$id"
+            asset_name["$kind"]="$name"
+            asset_digest["$kind"]="$digest"
+            asset_size["$kind"]="$size"
+            asset_created["$kind"]="$created_at"
+          done < "$assets_file"
+
+          for kind in image headers; do
+            if [[ ! ${asset_id["$kind"]+present} ]]; then
+              echo "::error::Existing Release is missing its $kind package"
+              exit 1
+            fi
+          done
+
+          existing_body="$(jq -r '.body // ""' "$release_json")"
+          build_time="$(
+            grep -Eo -m 1 \
+              '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' \
+              <<< "$existing_body" \
+              || true
+          )"
+          if [[ -z "$build_time" ]]; then
+            build_time="${asset_created[image]}"
+            if [[ "${asset_created[headers]}" < "$build_time" ]]; then
+              build_time="${asset_created[headers]}"
+            fi
+          fi
+          if ! [[ "$build_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            echo "::error::Could not determine the original UTC build time"
+            exit 1
+          fi
+
+          # Older GitHub assets may predate server-side digests. Refresh only
+          # those assets from their already-published bytes; no kernel rebuild
+          # is performed.
+          refresh_dir="$RUNNER_TEMP/release-refresh"
+          mkdir -p "$refresh_dir"
+          for kind in image headers; do
+            [[ "${asset_digest[$kind]}" =~ ^sha256:[0-9a-f]{64}$ ]] && continue
+
+            package_path="$refresh_dir/${asset_name[$kind]}"
+            if ! gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id[$kind]}" \
+              > "${package_path}.part"; then
+              echo "::error::Could not download the existing $kind asset"
+              exit 1
+            fi
+            mv "${package_path}.part" "$package_path"
+
+            package="$(dpkg-deb -f "$package_path" Package)"
+            version="$(dpkg-deb -f "$package_path" Version)"
+            architecture="$(dpkg-deb -f "$package_path" Architecture)"
+            expected_package="linux-${kind}-${KERNEL_RELEASE}"
+            if [[ "$package" != "$expected_package" ]]; then
+              echo "::error::Unexpected package name in existing $kind asset"
+              exit 1
+            fi
+            if [[ "$version" != "${KERNEL_RELEASE}-1" || "$architecture" != "amd64" ]]; then
+              echo "::error::Unexpected package metadata in existing $kind asset"
+              exit 1
+            fi
+            actual_size="$(stat -c '%s' "$package_path")"
+            if [[ "$actual_size" != "${asset_size[$kind]}" ]]; then
+              echo "::error::Existing $kind asset size changed during download"
+              exit 1
+            fi
+
+            gh api \
+              --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id[$kind]}"
+            gh release upload \
+              "$RELEASE_TAG" \
+              "$package_path" \
+              --repo "$GITHUB_REPOSITORY"
+          done
+
+          # Expected packages are confirmed before obsolete README/old package
+          # assets are removed.
+          for asset_id_to_delete in "${extra_asset_ids[@]}"; do
+            gh api \
+              --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id_to_delete}"
+          done
+
+          notes_file="$RUNNER_TEMP/release.md"
+          printf 'Version: `%s`\n\nBuild time: `%s`\n' \
+            "$KERNEL_RELEASE" \
+            "$build_time" \
+            > "$notes_file"
+          gh release edit \
+            "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$KERNEL_RELEASE" \
+            --notes-file "$notes_file" \
+            --draft=false \
+            --prerelease=false \
+            --latest
+
+          expected_body="$(cat "$notes_file")"
+          final_release_json="$RUNNER_TEMP/final-release.json"
+          final_assets_file="$RUNNER_TEMP/final-assets.tsv"
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            if ! gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              > "$final_release_json"; then
+              echo "::error::Could not verify normalized Release"
+              exit 1
+            fi
+            final_release_id="$(jq -er '.id' "$final_release_json")"
+            if ! gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/${final_release_id}/assets?per_page=100" \
+              --jq '
+                .[]
+                | [
+                    .name,
+                    .state,
+                    (.digest // ""),
+                    (.size | tostring)
+                  ]
+                | @tsv
+              ' > "$final_assets_file"; then
+              echo "::error::Could not verify normalized Release assets"
+              exit 1
+            fi
+
+            actual_name="$(jq -r '.name // ""' "$final_release_json")"
+            actual_body="$(jq -r '.body // ""' "$final_release_json")"
+            release_state_valid=false
+            if jq -e --arg tag "$RELEASE_TAG" '
+              .tag_name == $tag
+              and .draft == false
+              and .prerelease == false
+            ' "$final_release_json" >/dev/null; then
+              release_state_valid=true
+            fi
+            mapfile -t final_assets < "$final_assets_file"
+            assets_valid=true
+            if ((${#final_assets[@]} != 2)); then
+              assets_valid=false
+            else
+              found_image=false
+              found_headers=false
+              for record in "${final_assets[@]}"; do
+                IFS=$'\t' read -r name state digest size <<< "$record"
+                case "$name" in
+                  "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
+                    found_image=true
+                    ;;
+                  "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
+                    found_headers=true
+                    ;;
+                  *)
+                    assets_valid=false
+                    ;;
+                esac
+                if [[ "$state" != "uploaded" \
+                  || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ \
+                  || ! "$size" =~ ^[1-9][0-9]*$ ]]; then
+                  assets_valid=false
+                fi
+              done
+              [[ "$found_image" == true && "$found_headers" == true ]] \
+                || assets_valid=false
+            fi
+
+            if [[ "$actual_name" == "$KERNEL_RELEASE" \
+              && "$actual_body" == "$expected_body" \
+              && "$release_state_valid" == true \
+              && "$assets_valid" == true ]]; then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "$verified" == true ]] \
+            || { echo "::error::Normalized Release verification failed"; exit 1; }
 
   build:
     name: Build ${{ needs.check.outputs.source_tag }}
     needs: check
     if: needs.check.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
+    outputs:
+      build_time: ${{ steps.metadata.outputs.build_time }}
+      kernel_release: ${{ steps.krel.outputs.release }}
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Free disk space
         run: |
           set -euxo pipefail
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /usr/local/share/boost "${AGENT_TOOLSDIRECTORY:-}" || true
+            /usr/local/share/boost || true
+          if [[ "${AGENT_TOOLSDIRECTORY:-}" == "/opt/hostedtoolcache" ]]; then
+            sudo rm -rf /opt/hostedtoolcache
+          fi
           df -h
 
       - name: Install build dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential bc kmod cpio flex libncurses-dev \
-            libssl-dev libelf-dev bison dwarves debhelper rsync libdw-dev fakeroot
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc kmod cpio flex libssl-dev libelf-dev bison \
+            debhelper dpkg-dev rsync fakeroot xz-utils zstd
 
-      - name: Download current cloud config snapshot
-        uses: actions/download-artifact@v4
+      - name: Download current kernel config snapshot
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: cloud-configs-${{ github.run_id }}
+          name: kernel-configs-${{ github.run_id }}
           path: ${{ github.workspace }}
 
       - name: Clone stable kernel
         run: |
-          git clone --depth=1 --branch "${{ needs.check.outputs.source_tag }}" "$KERNEL_REPO" /tmp/linux
+          set -euo pipefail
+          git clone \
+            --depth=1 \
+            --single-branch \
+            --branch "${{ needs.check.outputs.source_tag }}" \
+            "$KERNEL_REPO" \
+            /tmp/linux
+          actual_commit="$(git -C /tmp/linux rev-parse HEAD)"
+          if [[ "$actual_commit" != "${{ needs.check.outputs.source_commit }}" ]]; then
+            echo "::error::Source tag moved: expected ${{ needs.check.outputs.source_commit }}, got $actual_commit"
+            exit 1
+          fi
+
+      - name: Add BBRv3 alongside BBRv1
+        id: bbr3
+        run: |
+          set -euo pipefail
+          cd /tmp/linux
+
+          bbr3_branch="${{ needs.check.outputs.bbr3_branch }}"
+          expected_tip="${{ needs.check.outputs.bbr3_tip }}"
+
+          # Fetch enough history to identify the complete, linear topic series
+          # relative to the matching upstream kernel instead of guessing by
+          # commit subject or a single changed file.
+          git fetch \
+            --no-tags \
+            --deepen=256 \
+            origin \
+            "${{ needs.check.outputs.source_tag }}"
+          git remote add cachyos "$BBR3_REPO"
+          git fetch \
+            --no-tags \
+            --filter=blob:none \
+            --depth=256 \
+            cachyos \
+            "$bbr3_branch"
+
+          bbr3_tip="$(git rev-parse FETCH_HEAD)"
+          if [[ "$bbr3_tip" != "$expected_tip" ]]; then
+            echo "::error::BBRv3 branch moved: expected $expected_tip, got $bbr3_tip"
+            exit 1
+          fi
+
+          merge_base="$(git merge-base HEAD "$bbr3_tip" || true)"
+          for deepen_by in 256 512 1024 2048; do
+            [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] && break
+
+            echo "Deepening BBRv3 history by $deepen_by commits..."
+            git fetch \
+              --no-tags \
+              --deepen="$deepen_by" \
+              origin \
+              "${{ needs.check.outputs.source_tag }}"
+            git fetch \
+              --no-tags \
+              --filter=blob:none \
+              --deepen="$deepen_by" \
+              cachyos \
+              "$bbr3_branch"
+
+            bbr3_tip="$(git rev-parse FETCH_HEAD)"
+            if [[ "$bbr3_tip" != "$expected_tip" ]]; then
+              echo "::error::BBRv3 branch moved while deepening history"
+              exit 1
+            fi
+            merge_base="$(git merge-base HEAD "$bbr3_tip" || true)"
+          done
+          if ! [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not find the BBRv3 merge base after deepening history"
+            exit 1
+          fi
+          merge_commits="$(git rev-list --merges "$merge_base..$bbr3_tip")"
+          if [[ -n "$merge_commits" ]]; then
+            echo "::error::BBRv3 topic branch contains merge commits"
+            exit 1
+          fi
+
+          commits_file="$RUNNER_TEMP/bbr3-commits"
+          if ! git rev-list --reverse "$merge_base..$bbr3_tip" \
+            > "$commits_file"; then
+            echo "::error::Could not enumerate the BBRv3 topic series"
+            exit 1
+          fi
+          mapfile -t bbr3_commits < "$commits_file"
+          if ((${#bbr3_commits[@]} == 0)); then
+            echo "::error::No BBRv3 commits found on $bbr3_branch"
+            exit 1
+          fi
+          if ((${#bbr3_commits[@]} > 64)); then
+            echo "::error::Unexpectedly large BBRv3 topic series"
+            exit 1
+          fi
+
+          allowed_bbr3_file() {
+            case "$1" in
+              include/linux/tcp.h | \
+              include/net/inet_connection_sock.h | \
+              include/net/tcp.h | \
+              include/net/tcp_ecn.h | \
+              include/uapi/linux/inet_diag.h | \
+              include/uapi/linux/rtnetlink.h | \
+              include/uapi/linux/tcp.h | \
+              net/ipv4/Kconfig | \
+              net/ipv4/Makefile | \
+              net/ipv4/bpf_tcp_ca.c | \
+              net/ipv4/tcp.c | \
+              net/ipv4/tcp_bbr.c | \
+              net/ipv4/tcp_bbr3.c | \
+              net/ipv4/tcp_cong.c | \
+              net/ipv4/tcp_input.c | \
+              net/ipv4/tcp_minisocks.c | \
+              net/ipv4/tcp_output.c | \
+              net/ipv4/tcp_timer.c | \
+              tools/testing/selftests/bpf/progs/tcp_ca_kfunc.c)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          changed_files_file="$RUNNER_TEMP/bbr3-changed-files"
+          if ! git diff --name-only "$merge_base" "$bbr3_tip" \
+            > "$changed_files_file"; then
+            echo "::error::Could not inspect the BBRv3 patch file list"
+            exit 1
+          fi
+          while IFS= read -r changed_file; do
+            if ! allowed_bbr3_file "$changed_file"; then
+              echo "::error::Unexpected file in BBRv3 patch: $changed_file"
+              exit 1
+            fi
+          done < "$changed_files_file"
+
+          git config user.name "Kernel Builder"
+          git config user.email "kernel-builder@users.noreply.github.com"
+          for commit in "${bbr3_commits[@]}"; do
+            git cherry-pick "$commit"
+          done
+
+          grep -q '^config TCP_CONG_BBR3$' net/ipv4/Kconfig
+          grep -Fq 'obj-$(CONFIG_TCP_CONG_BBR3) += tcp_bbr3.o' net/ipv4/Makefile
+          grep -qE '^#define BBR_VERSION[[:space:]]+3$' net/ipv4/tcp_bbr3.c
+          grep -qE '\.name[[:space:]]*=[[:space:]]*"bbr",' net/ipv4/tcp_bbr.c
+          grep -qE '\.name[[:space:]]*=[[:space:]]*"bbr3",' net/ipv4/tcp_bbr3.c
+
+          {
+            echo "branch=$bbr3_branch"
+            echo "tip=$bbr3_tip"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### BBR congestion control"
+            echo
+            echo "- BBRv1 registration: \`bbr\`"
+            echo "- BBRv3 registration: \`bbr3\`"
+            echo "- BBRv3 source: \`$bbr3_branch @ ${bbr3_tip:0:12}\`"
+            echo "- Applied commits: \`${#bbr3_commits[@]}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure kernel
         run: |
           set -euxo pipefail
           cd /tmp/linux
 
-          # Start with the runner's complete config.
-          cp /boot/config-"$(uname -r)" .config
-          make olddefconfig
-          grep -v '^##' "$GITHUB_WORKSPACE/config.cloud" > /tmp/frag.cloud
-          grep -v '^##' "$GITHUB_WORKSPACE/config.cloud-amd64" > /tmp/frag.cloud-amd64
+          # Reproduce Debian's four cloud-amd64 layers. The project overlay is
+          # deliberately last so required VPS and container features win over
+          # Debian's hardware trimming.
+          for fragment in \
+            config.debian \
+            config.amd64 \
+            config.cloud \
+            config.cloud-amd64 \
+            config.vps; do
+            if [[ ! -s "$GITHUB_WORKSPACE/$fragment" ]]; then
+              echo "::error::Missing kernel config fragment: $fragment"
+              exit 1
+            fi
+          done
+
+          cp "$GITHUB_WORKSPACE/config.debian" .config
           scripts/kconfig/merge_config.sh -m .config \
-            /tmp/frag.cloud \
-            /tmp/frag.cloud-amd64
+            "$GITHUB_WORKSPACE/config.amd64" \
+            "$GITHUB_WORKSPACE/config.cloud" \
+            "$GITHUB_WORKSPACE/config.cloud-amd64" \
+            "$GITHUB_WORKSPACE/config.vps"
 
           # A localversion file is consumed by every Kbuild invocation,
-          # including the recursive make calls used by deb-pkg.
+          # including the recursive make calls used by bindeb-pkg.
           printf '%s\n' '-shouyu' > localversion-shouyu
-          scripts/config --set-str LOCALVERSION ""
-          scripts/config --disable LOCALVERSION_AUTO
 
-          # Custom size and signing settings.
-          scripts/config --disable DEBUG_INFO
-          scripts/config --disable DEBUG_INFO_DWARF5
-          scripts/config --enable DEBUG_INFO_NONE
-          scripts/config --disable MODULE_SIG
-          scripts/config --disable MODULE_SIG_ALL
-          scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
-          scripts/config --set-str SYSTEM_REVOCATION_KEYS ""
-
-          # BBR.
-          scripts/config --enable TCP_CONG_ADVANCED
-          scripts/config --enable TCP_CONG_BBR
-          scripts/config --enable DEFAULT_BBR
-          scripts/config --disable DEFAULT_CUBIC
-          scripts/config --set-str DEFAULT_TCP_CONG bbr
-
-          # Server tuning.
-          scripts/config --set-val NR_CPUS 64
-          scripts/config --enable NO_HZ_IDLE
-          scripts/config --enable HZ_250
-          scripts/config --disable HZ_1000
-          scripts/config --enable PREEMPT_VOLUNTARY
-          scripts/config --disable PREEMPT
-
-          # Ensure cloud fragments do not disable Docker requirements.
-          scripts/config --enable CGROUPS
-          scripts/config --enable NAMESPACES
-          scripts/config --enable NET_NS
-          scripts/config --enable PID_NS
-          scripts/config --enable IPC_NS
-          scripts/config --enable UTS_NS
-          scripts/config --enable USER_NS
-          scripts/config --enable MEMCG
-          scripts/config --enable CGROUP_PIDS
-          scripts/config --enable CGROUP_DEVICE
-          scripts/config --enable CGROUP_FREEZER
-          scripts/config --enable CPUSETS
-          scripts/config --enable BLK_CGROUP
-          scripts/config --enable VETH
-          scripts/config --enable BRIDGE
-          scripts/config --enable BRIDGE_NETFILTER
-          scripts/config --enable NETFILTER_XT_MATCH_CONNTRACK
-          scripts/config --enable NETFILTER_XT_MATCH_ADDRTYPE
-          scripts/config --enable NF_NAT
-          scripts/config --enable IP_NF_NAT
-          scripts/config --enable IP_NF_FILTER
-          scripts/config --enable IP_NF_IPTABLES
-          scripts/config --enable IP_NF_TARGET_MASQUERADE
-          scripts/config --module OVERLAY_FS
-          scripts/config --enable SECCOMP
-          scripts/config --enable SECCOMP_FILTER
-          scripts/config --enable POSIX_MQUEUE
-          make olddefconfig
+          KCONFIG_WARN_UNKNOWN_SYMBOLS=1 \
+          KCONFIG_WARN_CHANGED_INPUT=1 \
+            make olddefconfig
 
           echo "=== Verifying kernel config ==="
           fail=0
-          check_config() {
-            if ! grep -qE "$1" .config; then
-              echo "::error::MISSING: $1"
+          check_builtin() {
+            if ! grep -qxF "CONFIG_$1=y" .config; then
+              echo "::error::CONFIG_$1 must be built in"
+              fail=1
+            fi
+          }
+          check_module() {
+            if ! grep -qxF "CONFIG_$1=m" .config; then
+              echo "::error::CONFIG_$1 must be a module"
+              fail=1
+            fi
+          }
+          check_enabled() {
+            if ! grep -qE "^CONFIG_$1=(y|m)$" .config; then
+              echo "::error::CONFIG_$1 must be enabled"
+              fail=1
+            fi
+          }
+          check_disabled() {
+            if ! grep -qxF "# CONFIG_$1 is not set" .config; then
+              echo "::error::CONFIG_$1 must be disabled"
+              fail=1
+            fi
+          }
+          check_value() {
+            if ! grep -qxF "CONFIG_$1=$2" .config; then
+              echo "::error::CONFIG_$1 must equal $2"
               fail=1
             fi
           }
 
-          check_config '^CONFIG_LOCALVERSION=""$'
-          check_config '^# CONFIG_LOCALVERSION_AUTO is not set$'
+          while IFS= read -r requested_setting; do
+            if [[ ! "$requested_setting" =~ ^CONFIG_[A-Z0-9_]+= \
+              && ! "$requested_setting" =~ ^#\ CONFIG_[A-Z0-9_]+\ is\ not\ set$ ]]; then
+              continue
+            fi
+            if ! grep -qxF "$requested_setting" .config; then
+              echo "::error::Overlay request was not honored: $requested_setting"
+              fail=1
+            fi
+          done < "$GITHUB_WORKSPACE/config.vps"
+
+          required_builtin=(
+            X86_64 SMP PREEMPT_LAZY PCI PCI_MSI ACPI BLK_DEV_INITRD
+            DEVTMPFS DEVTMPFS_MOUNT PROC_FS SYSFS TMPFS EFI EFI_STUB
+            SERIAL_8250 SERIAL_8250_CONSOLE
+            MODULES MODULE_UNLOAD MODULE_COMPRESS_ZSTD MODULE_DECOMPRESS
+            MODULE_SIG SCSI
+            PACKET UNIX INET IPV6 NET_SCHED NET_SCH_FQ DEFAULT_FQ
+            TCP_CONG_CUBIC TCP_CONG_BBR DEFAULT_BBR
+            HYPERVISOR_GUEST PARAVIRT VIRTIO VIRTIO_PCI EXT4_FS
+            NAMESPACES NET_NS PID_NS IPC_NS UTS_NS USER_NS
+            CGROUPS CGROUP_CPUACCT CGROUP_DEVICE CGROUP_FREEZER
+            CGROUP_SCHED CGROUP_PIDS CGROUP_BPF CPUSETS MEMCG
+            BLK_CGROUP BLK_DEV_THROTTLING FAIR_GROUP_SCHED CFS_BANDWIDTH
+            KEYS SECCOMP SECCOMP_FILTER POSIX_MQUEUE BPF BPF_SYSCALL
+            NETFILTER
+          )
+          required_modules=(
+            TCP_CONG_BBR3 VIRTIO_BLK SCSI_VIRTIO VIRTIO_NET
+            VIRTIO_CONSOLE VIRTIO_BALLOON HW_RANDOM_VIRTIO
+            XEN_BLKDEV_FRONTEND XEN_NETDEV_FRONTEND
+            HYPERV_STORAGE HYPERV_NET VMWARE_PVSCSI VMXNET3
+            E1000 E1000E ENA_ETHERNET GVE MICROSOFT_MANA I40EVF
+          )
+          required_enabled=(
+            BLK_DEV_SD SATA_AHCI ATA_PIIX BLK_DEV_NVME
+            XEN HYPERV OVERLAY_FS XFS_FS BTRFS_FS FUSE_FS
+            TUN VETH BRIDGE BRIDGE_NETFILTER VXLAN IPVLAN MACVLAN
+            NF_CONNTRACK NF_NAT NF_TABLES NFT_CT NFT_NAT NFT_MASQ
+            NETFILTER_XT_MARK NETFILTER_XT_MATCH_ADDRTYPE
+            NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_IPVS
+            IP_NF_FILTER IP_NF_RAW IP_NF_MANGLE IP_NF_NAT
+            IP_NF_TARGET_MASQUERADE IP6_NF_FILTER IP6_NF_RAW
+            IP6_NF_MANGLE IP6_NF_NAT IP6_NF_TARGET_MASQUERADE
+            IP_VS WIREGUARD
+            SWAP PSI CGROUP_HUGETLB CGROUP_MISC
+            SECURITY SECURITY_APPARMOR AUDIT
+            NF_TABLES_INET NF_CONNTRACK_BRIDGE
+            NETFILTER_XT_MATCH_COMMENT NETFILTER_XT_MATCH_MULTIPORT
+            NETFILTER_XT_TARGET_REDIRECT
+            IP_NF_TARGET_REJECT IP6_NF_TARGET_REJECT
+            VLAN_8021Q OPENVSWITCH MPLS
+          )
+
+          for symbol in "${required_builtin[@]}"; do
+            check_builtin "$symbol"
+          done
+          for symbol in "${required_modules[@]}"; do
+            check_module "$symbol"
+          done
+          for symbol in "${required_enabled[@]}"; do
+            check_enabled "$symbol"
+          done
+
+          check_value LOCALVERSION '""'
+          check_value NR_CPUS 256
+          check_value HZ 250
+          check_value DEFAULT_TCP_CONG '"bbr"'
+          check_value DEFAULT_NET_SCH '"fq"'
+          check_disabled LOCALVERSION_AUTO
+          check_disabled DEFAULT_BBR3
+          check_disabled MODULE_SIG_ALL
+          check_disabled MODULE_SIG_FORCE
+          check_disabled WERROR
+          check_disabled DEBUG_INFO
           [[ "$(cat localversion-shouyu)" == "-shouyu" ]] || {
             echo "::error::localversion-shouyu is invalid"
             fail=1
           }
-          check_config '^CONFIG_TCP_CONG_BBR=(y|m)'
-          check_config '^CONFIG_DEFAULT_TCP_CONG="bbr"'
-          check_config '^CONFIG_NAMESPACES=y'
-          check_config '^CONFIG_NET_NS=y'
-          check_config '^CONFIG_PID_NS=y'
-          check_config '^CONFIG_CGROUPS=y'
-          check_config '^CONFIG_MEMCG=y'
-          check_config '^CONFIG_VETH=(y|m)'
-          check_config '^CONFIG_BRIDGE=(y|m)'
-          check_config '^CONFIG_OVERLAY_FS=(y|m)'
-          check_config '^CONFIG_NETFILTER_XT_MATCH_CONNTRACK=(y|m)'
-          check_config '^CONFIG_NF_NAT=(y|m)'
-          check_config '^CONFIG_IP_NF_NAT=(y|m)'
-          check_config '^CONFIG_SECCOMP=y'
-          check_config '^CONFIG_VIRTIO_NET=(y|m)'
-          check_config '^CONFIG_VIRTIO_BLK=(y|m)'
-          check_config '^CONFIG_EXT4_FS=(y|m)'
 
           if [[ "$fail" -ne 0 ]]; then
             echo "::error::Kernel config verification failed"
@@ -353,7 +966,9 @@ jobs:
             echo "::error::Unexpected kernel release: $KREL"
             exit 1
           fi
-          fakeroot make -j"$(nproc)" deb-pkg KDEB_PKGVERSION="${KREL}-1"
+          fakeroot make -j"$(nproc)" bindeb-pkg \
+            KBUILD_DEBARCH=amd64 \
+            KDEB_PKGVERSION="${KREL}-1"
 
       - name: Get kernel release
         id: krel
@@ -369,66 +984,395 @@ jobs:
           echo "release=$release" >> "$GITHUB_OUTPUT"
 
       - name: Collect and verify Debian packages
+        id: packages
         run: |
           set -euxo pipefail
-          mkdir -p artifacts
-          find /tmp -maxdepth 1 -type f \
-            \( -name "linux-image-*.deb" -o -name "linux-headers-*.deb" \) \
-            -exec cp -v {} artifacts/ \;
-          ls -lh artifacts/
-          find artifacts -name "linux-image-*.deb" | grep -q . || \
-            { echo "::error::linux-image package missing"; exit 1; }
-          find artifacts -name "linux-headers-*.deb" | grep -q . || \
-            { echo "::error::linux-headers package missing"; exit 1; }
+          krel="${{ steps.krel.outputs.release }}"
+          shopt -s nullglob
+          image_packages=(/tmp/"linux-image-${krel}_"*"_amd64.deb")
+          header_packages=(/tmp/"linux-headers-${krel}_"*"_amd64.deb")
 
-      - name: Verify BBR in image package
+          if ((${#image_packages[@]} != 1)); then
+            echo "::error::Expected exactly one linux-image package, found ${#image_packages[@]}"
+            printf '  %s\n' "${image_packages[@]:-}"
+            exit 1
+          fi
+          if ((${#header_packages[@]} != 1)); then
+            echo "::error::Expected exactly one linux-headers package, found ${#header_packages[@]}"
+            printf '  %s\n' "${header_packages[@]:-}"
+            exit 1
+          fi
+
+          verify_deb() {
+            local deb="$1"
+            local expected_package="$2"
+            local package
+            local architecture
+            local version
+            package="$(dpkg-deb -f "$deb" Package)"
+            architecture="$(dpkg-deb -f "$deb" Architecture)"
+            version="$(dpkg-deb -f "$deb" Version)"
+            if [[ "$package" != "$expected_package" \
+              || "$architecture" != "amd64" \
+              || "$version" != "${krel}-1" ]]; then
+              echo "::error::Unexpected package metadata: $package $version ($architecture)"
+              exit 1
+            fi
+          }
+
+          verify_deb "${image_packages[0]}" "linux-image-$krel"
+          verify_deb "${header_packages[0]}" "linux-headers-$krel"
+
+          mkdir -p artifacts
+          cp -v "${image_packages[0]}" "${header_packages[0]}" artifacts/
+          ls -lh artifacts/
+
+          {
+            echo "image=$(basename "${image_packages[0]}")"
+            echo "headers=$(basename "${header_packages[0]}")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify image package contents
         run: |
           set -euxo pipefail
-          image_deb="$(find artifacts -name "linux-image-*.deb" | head -n 1)"
+          krel="${{ steps.krel.outputs.release }}"
+          image_deb="artifacts/${{ steps.packages.outputs.image }}"
           mkdir -p /tmp/img-check
           dpkg-deb -x "$image_deb" /tmp/img-check
 
-          if find /tmp/img-check/lib/modules -type f \
-            \( -name "tcp_bbr.ko" -o -name "tcp_bbr.ko.*" \) | grep -q .; then
-            echo "BBR module found"
-            exit 0
+          cfg="/tmp/img-check/boot/config-$krel"
+          module_root="/tmp/img-check/lib/modules/$krel"
+          if [[ ! -s "$cfg" || ! -d "$module_root" ]]; then
+            echo "::error::Kernel config missing from image package"
+            exit 1
           fi
 
-          cfg="$(find /tmp/img-check/boot -type f -name "config-*" | head -n 1)"
-          grep -q '^CONFIG_TCP_CONG_BBR=y' "$cfg" || \
-            { echo "::error::BBR not built-in"; exit 1; }
+          verify_feature() {
+            local display_name="$1"
+            local config_symbol="$2"
+            local module_name="$3"
 
-      - name: Generate README
+            if grep -q "^CONFIG_${config_symbol}=y$" "$cfg"; then
+              echo "$display_name is built in"
+              return
+            fi
+
+            if grep -q "^CONFIG_${config_symbol}=m$" "$cfg" \
+              && find "$module_root" -type f \
+                \( -name "${module_name}.ko" -o -name "${module_name}.ko.*" \) \
+                -print -quit | grep -q .; then
+              echo "$display_name module found"
+              return
+            fi
+
+            echo "::error::$display_name is missing from the image package"
+            exit 1
+          }
+
+          verify_feature BBRv1 TCP_CONG_BBR tcp_bbr
+          verify_feature BBRv3 TCP_CONG_BBR3 tcp_bbr3
+          verify_feature "VirtIO block" VIRTIO_BLK virtio_blk
+          verify_feature "VirtIO SCSI" SCSI_VIRTIO virtio_scsi
+          verify_feature "VirtIO network" VIRTIO_NET virtio_net
+          verify_feature "Xen block" XEN_BLKDEV_FRONTEND xen-blkfront
+          verify_feature "Xen network" XEN_NETDEV_FRONTEND xen-netfront
+          verify_feature "Hyper-V storage" HYPERV_STORAGE hv_storvsc
+          verify_feature "Hyper-V network" HYPERV_NET hv_netvsc
+          verify_feature "VMware storage" VMWARE_PVSCSI vmw_pvscsi
+          verify_feature "VMware network" VMXNET3 vmxnet3
+          verify_feature "AWS ENA" ENA_ETHERNET ena
+          verify_feature "Google gVNIC" GVE gve
+          verify_feature "Azure MANA" MICROSOFT_MANA mana
+          verify_feature "Intel iAVF" I40EVF iavf
+
+          grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"$' "$cfg" || \
+            { echo "::error::BBRv1 is not the default"; exit 1; }
+          grep -q '^CONFIG_DEFAULT_NET_SCH="fq"$' "$cfg" || \
+            { echo "::error::FQ is not the default qdisc"; exit 1; }
+
+      - name: Record build time
+        id: metadata
         run: |
           set -euo pipefail
-          cat > artifacts/README.md <<EOF
-          # Debian Kernel Build
-          | Item | Value |
-          |------|-------|
-          | Kernel Version | \`${{ steps.krel.outputs.release }}\` |
-          | Upstream Source | \`${{ needs.check.outputs.source_tag }}\` |
-          | Debian Config Source | \`${{ needs.check.outputs.config_commit }}\` |
-          | Build Date | $(date -u '+%Y-%m-%d %H:%M UTC') |
-          | Base Config | Ubuntu runner (Docker-ready) |
-          | BBR | Default congestion control |
-          | Docker Support | cgroups, namespaces, overlay, veth, bridge, netfilter |
-          EOF
+          echo "build_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: "Debian Kernel ${{ steps.krel.outputs.release }}"
-          path: artifacts/*
+          name: kernel-packages-${{ github.run_id }}
+          path: artifacts/*.deb
           if-no-files-found: error
-          retention-days: 14
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Release ${{ needs.build.outputs.kernel_release }}
+    needs:
+      - check
+      - build
+    if: needs.check.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified kernel packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          tag_name: ${{ needs.check.outputs.release_tag }}
-          name: "Debian Kernel ${{ steps.krel.outputs.release }}"
-          files: artifacts/*
-          body_path: artifacts/README.md
-          fail_on_unmatched_files: true
+          name: kernel-packages-${{ github.run_id }}
+          path: artifacts
+
+      - name: Create or repair Release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          BUILD_TIME: ${{ needs.build.outputs.build_time }}
+          KERNEL_RELEASE: ${{ needs.build.outputs.kernel_release }}
+          RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
+          RELEASE_TARGET: ${{ needs.check.outputs.release_target }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          if ! [[ "$RELEASE_TAG" == "v${KERNEL_RELEASE}" \
+            && "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-shouyu$ \
+            && "$RELEASE_TARGET" =~ ^[0-9a-f]{40}$ \
+            && "$BUILD_TIME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            echo "::error::Unsafe Release metadata"
+            exit 1
+          fi
+
+          packages=(artifacts/*.deb)
+          if ((${#packages[@]} != 2)); then
+            echo "::error::Expected exactly two verified packages"
+            exit 1
+          fi
+
+          declare -A local_path=()
+          declare -A local_name=()
+          declare -A local_digest=()
+          declare -A local_size=()
+          for package_path in "${packages[@]}"; do
+            filename="$(basename "$package_path")"
+            case "$filename" in
+              "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
+                kind=image
+                ;;
+              "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
+                kind=headers
+                ;;
+              *)
+                echo "::error::Unexpected Release package: $filename"
+                exit 1
+                ;;
+            esac
+            if [[ ${local_path["$kind"]+present} ]]; then
+              echo "::error::Duplicate $kind package"
+              exit 1
+            fi
+            local_path["$kind"]="$package_path"
+            local_name["$kind"]="$filename"
+            local_digest["$kind"]="sha256:$(sha256sum "$package_path" | awk '{ print $1 }')"
+            local_size["$kind"]="$(stat -c '%s' "$package_path")"
+          done
+          for kind in image headers; do
+            [[ ${local_path["$kind"]+present} ]] \
+              || { echo "::error::Missing $kind package"; exit 1; }
+          done
+
+          notes_file="$RUNNER_TEMP/release.md"
+          printf 'Version: `%s`\n\nBuild time: `%s`\n' \
+            "$KERNEL_RELEASE" \
+            "$BUILD_TIME" \
+            > "$notes_file"
+
+          release_json="$RUNNER_TEMP/release-before.json"
+          release_error="$RUNNER_TEMP/release-before.err"
+          release_exists=false
+          if gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            > "$release_json" 2> "$release_error"; then
+            release_exists=true
+          elif grep -q 'HTTP 404' "$release_error"; then
+            release_exists=false
+          else
+            cat "$release_error" >&2
+            echo "::error::Could not determine whether the Release exists"
+            exit 1
+          fi
+
+          if [[ "$release_exists" == true ]]; then
+            release_id="$(jq -er '.id' "$release_json")"
+            remote_assets_file="$RUNNER_TEMP/release-assets-before.tsv"
+            if ! gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" \
+              --jq '
+                .[]
+                | [
+                    (.id | tostring),
+                    .name,
+                    .state,
+                    (.digest // ""),
+                    (.size | tostring)
+                  ]
+                | @tsv
+              ' > "$remote_assets_file"; then
+              echo "::error::Could not query existing Release assets"
+              exit 1
+            fi
+
+            declare -A remote_id=()
+            declare -A remote_state=()
+            declare -A remote_digest=()
+            declare -A remote_size=()
+            declare -a remote_names=()
+            while IFS=$'\t' read -r id name state digest size; do
+              if [[ ${remote_id["$name"]+present} ]]; then
+                echo "::error::Duplicate asset name in existing Release: $name"
+                exit 1
+              fi
+              remote_names+=("$name")
+              remote_id["$name"]="$id"
+              remote_state["$name"]="$state"
+              remote_digest["$name"]="$digest"
+              remote_size["$name"]="$size"
+            done < "$remote_assets_file"
+
+            # Fill missing packages first so a repair never starts by emptying
+            # an existing public Release.
+            for kind in image headers; do
+              name="${local_name[$kind]}"
+              if [[ ! ${remote_id["$name"]+present} ]]; then
+                gh release upload \
+                  "$RELEASE_TAG" \
+                  "${local_path[$kind]}" \
+                  --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+
+            # Replace only conflicting expected packages, one at a time.
+            for kind in image headers; do
+              name="${local_name[$kind]}"
+              [[ ${remote_id["$name"]+present} ]] || continue
+              if [[ "${remote_state[$name]}" != "uploaded" \
+                || "${remote_digest[$name]}" != "${local_digest[$kind]}" \
+                || "${remote_size[$name]}" != "${local_size[$kind]}" ]]; then
+                gh api \
+                  --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/releases/assets/${remote_id[$name]}"
+                gh release upload \
+                  "$RELEASE_TAG" \
+                  "${local_path[$kind]}" \
+                  --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+
+            # Remove obsolete README or old package assets only after both
+            # expected packages have been uploaded or retained.
+            for name in "${remote_names[@]}"; do
+              if [[ "$name" != "${local_name[image]}" \
+                && "$name" != "${local_name[headers]}" ]]; then
+                gh api \
+                  --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/releases/assets/${remote_id[$name]}"
+              fi
+            done
+
+            gh release edit \
+              "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$KERNEL_RELEASE" \
+              --notes-file "$notes_file" \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          else
+            gh release create \
+              "$RELEASE_TAG" \
+              "${packages[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$KERNEL_RELEASE" \
+              --notes-file "$notes_file" \
+              --target "$RELEASE_TARGET" \
+              --latest
+          fi
+
+          expected_body="$(cat "$notes_file")"
+          final_release_json="$RUNNER_TEMP/release-after.json"
+          final_assets_file="$RUNNER_TEMP/release-assets-after.tsv"
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            if ! gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+              > "$final_release_json"; then
+              echo "::error::Could not verify the Release"
+              exit 1
+            fi
+            final_release_id="$(jq -er '.id' "$final_release_json")"
+            if ! gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/${final_release_id}/assets?per_page=100" \
+              --jq '
+                .[]
+                | [
+                    .name,
+                    .state,
+                    (.digest // ""),
+                    (.size | tostring)
+                  ]
+                | @tsv
+              ' > "$final_assets_file"; then
+              echo "::error::Could not verify Release assets"
+              exit 1
+            fi
+
+            actual_name="$(jq -r '.name // ""' "$final_release_json")"
+            actual_body="$(jq -r '.body // ""' "$final_release_json")"
+            release_state_valid=false
+            if jq -e --arg tag "$RELEASE_TAG" '
+              .tag_name == $tag
+              and .draft == false
+              and .prerelease == false
+            ' "$final_release_json" >/dev/null; then
+              release_state_valid=true
+            fi
+            mapfile -t final_assets < "$final_assets_file"
+            assets_valid=true
+            declare -A verified_kinds=()
+            if ((${#final_assets[@]} != 2)); then
+              assets_valid=false
+            else
+              for record in "${final_assets[@]}"; do
+                IFS=$'\t' read -r name state digest size <<< "$record"
+                kind=""
+                if [[ "$name" == "${local_name[image]}" ]]; then
+                  kind=image
+                elif [[ "$name" == "${local_name[headers]}" ]]; then
+                  kind=headers
+                else
+                  assets_valid=false
+                  continue
+                fi
+                verified_kinds["$kind"]=1
+                if [[ "$state" != "uploaded" \
+                  || "$digest" != "${local_digest[$kind]}" \
+                  || "$size" != "${local_size[$kind]}" ]]; then
+                  assets_valid=false
+                fi
+              done
+              [[ ${verified_kinds["image"]+present} \
+                && ${verified_kinds["headers"]+present} ]] \
+                || assets_valid=false
+            fi
+
+            if [[ "$actual_name" == "$KERNEL_RELEASE" \
+              && "$actual_body" == "$expected_body" \
+              && "$release_state_valid" == true \
+              && "$assets_valid" == true ]]; then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          [[ "$verified" == true ]] \
+            || { echo "::error::Release verification failed"; exit 1; }
