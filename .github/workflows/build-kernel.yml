@@ -27,7 +27,9 @@ jobs:
     permissions:
       contents: write
     outputs:
+      bbr3_base: ${{ steps.bbr3-source.outputs.base }}
       bbr3_branch: ${{ steps.bbr3-source.outputs.branch }}
+      bbr3_commit_count: ${{ steps.bbr3-source.outputs.commit_count }}
       bbr3_tip: ${{ steps.bbr3-source.outputs.tip }}
       config_commit: ${{ steps.configs.outputs.config_commit }}
       configs_changed: ${{ steps.configs.outputs.configs_changed }}
@@ -297,9 +299,12 @@ jobs:
       - name: Resolve BBRv3 source
         id: bbr3-source
         if: steps.version.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           kernel_series="$(cut -d. -f1,2 <<< "${{ steps.version.outputs.version }}")"
+          series_tag="v${kernel_series}"
           branch="${kernel_series}/bbr3"
           tip="$(
             git ls-remote --heads "$BBR3_REPO" "refs/heads/$branch" \
@@ -311,10 +316,110 @@ jobs:
             exit 1
           fi
 
+          # Compare the topic tip with the matching mainline release through
+          # GitHub's API. This pins the short, unique topic chain without
+          # downloading thousands of unrelated commits from both repositories.
+          series_commit="$(
+            git ls-remote "$KERNEL_REPO" \
+              "refs/tags/${series_tag}" \
+              "refs/tags/${series_tag}^{}" \
+              | awk '
+                  /\^\{\}$/ { print $1; found=1; exit }
+                  { fallback=$1 }
+                  END { if (!found && fallback) print fallback }
+                '
+          )"
+          if ! [[ "$series_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve mainline series tag $series_tag"
+            exit 1
+          fi
+
+          bbr3_repository="${BBR3_REPO#https://github.com/}"
+          bbr3_repository="${bbr3_repository%.git}"
+          if ! [[ "$bbr3_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Unexpected BBRv3 repository URL: $BBR3_REPO"
+            exit 1
+          fi
+
+          comparison="$RUNNER_TEMP/bbr3-comparison.json"
+          if ! gh api \
+            --method GET \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f per_page=100 \
+            "repos/$bbr3_repository/compare/$series_commit...$tip" \
+            > "$comparison"; then
+            echo "::error::Could not compare the BBRv3 topic branch"
+            exit 1
+          fi
+
+          status="$(jq -r '.status // empty' "$comparison")"
+          requested_base="$(jq -r '.base_commit.sha // empty' "$comparison")"
+          base="$(jq -r '.merge_base_commit.sha // empty' "$comparison")"
+          ahead_by="$(jq -r '.ahead_by // empty' "$comparison")"
+          total_commits="$(jq -r '.total_commits // empty' "$comparison")"
+          commit_count="$(jq -r '.commits | length' "$comparison")"
+
+          if [[ "$status" != "ahead" && "$status" != "diverged" ]]; then
+            echo "::error::Unexpected BBRv3 comparison status: $status"
+            exit 1
+          fi
+          if [[ "$requested_base" != "$series_commit" ]]; then
+            echo "::error::BBRv3 comparison base does not match the requested commit"
+            exit 1
+          fi
+          if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid BBRv3 topic base"
+            exit 1
+          fi
+          if ! [[ "$ahead_by" =~ ^[0-9]+$ &&
+                  "$total_commits" =~ ^[0-9]+$ &&
+                  "$commit_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid BBRv3 topic commit counts"
+            exit 1
+          fi
+          if ((commit_count == 0 || commit_count > 64 ||
+              ahead_by != commit_count || total_commits != commit_count)); then
+            echo "::error::Unexpected BBRv3 topic series size"
+            exit 1
+          fi
+
+          previous="$base"
+          for ((index = 0; index < commit_count; index++)); do
+            commit="$(jq -r ".commits[$index].sha // empty" "$comparison")"
+            parent_count="$(jq -r ".commits[$index].parents | length" "$comparison")"
+            parent="$(jq -r ".commits[$index].parents[0].sha // empty" "$comparison")"
+            if ! [[ "$commit" =~ ^[0-9a-f]{40}$ &&
+                    "$parent" =~ ^[0-9a-f]{40}$ &&
+                    "$parent_count" == "1" ]]; then
+              echo "::error::BBRv3 topic history is not linear"
+              exit 1
+            fi
+            if [[ "$parent" != "$previous" ]]; then
+              echo "::error::BBRv3 comparison returned a discontinuous topic chain"
+              exit 1
+            fi
+            previous="$commit"
+          done
+          if [[ "$previous" != "$tip" ]]; then
+            echo "::error::BBRv3 comparison tip does not match the advertised branch"
+            exit 1
+          fi
+
           {
+            echo "base=$base"
             echo "branch=$branch"
+            echo "commit_count=$commit_count"
             echo "tip=$tip"
           } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### BBRv3 source"
+            echo
+            echo "- Branch: \`$branch\`"
+            echo "- Topic base: \`${base:0:12}\`"
+            echo "- Topic commits: \`$commit_count\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload kernel config snapshot
         if: steps.version.outputs.should_build == 'true'
@@ -613,6 +718,10 @@ jobs:
       kernel_release: ${{ steps.krel.outputs.release }}
     permissions:
       contents: read
+    env:
+      # A defined LOCALVERSION suppresses the SCM "+" added after the BBRv3
+      # commits, while remaining inherited by bindeb-pkg's recursive make.
+      LOCALVERSION: "-shouyu"
 
     steps:
       - name: Free disk space
@@ -661,21 +770,29 @@ jobs:
           cd /tmp/linux
 
           bbr3_branch="${{ needs.check.outputs.bbr3_branch }}"
+          expected_base="${{ needs.check.outputs.bbr3_base }}"
+          expected_commit_count="${{ needs.check.outputs.bbr3_commit_count }}"
           expected_tip="${{ needs.check.outputs.bbr3_tip }}"
 
-          # Fetch enough history to identify the complete, linear topic series
-          # relative to the matching upstream kernel instead of guessing by
-          # commit subject or a single changed file.
-          git fetch \
-            --no-tags \
-            --deepen=256 \
-            origin \
-            "${{ needs.check.outputs.source_tag }}"
+          if ! [[ "$expected_base" =~ ^[0-9a-f]{40}$ &&
+                  "$expected_tip" =~ ^[0-9a-f]{40}$ &&
+                  "$expected_commit_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid pinned BBRv3 source metadata"
+            exit 1
+          fi
+          if ((expected_commit_count == 0 || expected_commit_count > 64)); then
+            echo "::error::Unexpected pinned BBRv3 topic series size"
+            exit 1
+          fi
+
+          # The check job has already pinned and validated the linear topic
+          # chain. Fetch only that chain plus its base instead of deepening two
+          # repositories until their distant common ancestor becomes visible.
           git remote add cachyos "$BBR3_REPO"
           git fetch \
             --no-tags \
             --filter=blob:none \
-            --depth=256 \
+            --depth="$((expected_commit_count + 1))" \
             cachyos \
             "$bbr3_branch"
 
@@ -685,42 +802,19 @@ jobs:
             exit 1
           fi
 
-          merge_base="$(git merge-base HEAD "$bbr3_tip" || true)"
-          for deepen_by in 256 512 1024 2048; do
-            [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] && break
-
-            echo "Deepening BBRv3 history by $deepen_by commits..."
-            git fetch \
-              --no-tags \
-              --deepen="$deepen_by" \
-              origin \
-              "${{ needs.check.outputs.source_tag }}"
-            git fetch \
-              --no-tags \
-              --filter=blob:none \
-              --deepen="$deepen_by" \
-              cachyos \
-              "$bbr3_branch"
-
-            bbr3_tip="$(git rev-parse FETCH_HEAD)"
-            if [[ "$bbr3_tip" != "$expected_tip" ]]; then
-              echo "::error::BBRv3 branch moved while deepening history"
-              exit 1
-            fi
-            merge_base="$(git merge-base HEAD "$bbr3_tip" || true)"
-          done
-          if ! [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Could not find the BBRv3 merge base after deepening history"
+          topic_base="$(git rev-parse "${bbr3_tip}~${expected_commit_count}")"
+          if [[ "$topic_base" != "$expected_base" ]]; then
+            echo "::error::BBRv3 topic base does not match the pinned comparison"
             exit 1
           fi
-          merge_commits="$(git rev-list --merges "$merge_base..$bbr3_tip")"
+          merge_commits="$(git rev-list --merges "$topic_base..$bbr3_tip")"
           if [[ -n "$merge_commits" ]]; then
             echo "::error::BBRv3 topic branch contains merge commits"
             exit 1
           fi
 
           commits_file="$RUNNER_TEMP/bbr3-commits"
-          if ! git rev-list --reverse "$merge_base..$bbr3_tip" \
+          if ! git rev-list --reverse "$topic_base..$bbr3_tip" \
             > "$commits_file"; then
             echo "::error::Could not enumerate the BBRv3 topic series"
             exit 1
@@ -730,8 +824,8 @@ jobs:
             echo "::error::No BBRv3 commits found on $bbr3_branch"
             exit 1
           fi
-          if ((${#bbr3_commits[@]} > 64)); then
-            echo "::error::Unexpectedly large BBRv3 topic series"
+          if ((${#bbr3_commits[@]} != expected_commit_count)); then
+            echo "::error::BBRv3 topic commit count does not match the pinned comparison"
             exit 1
           fi
 
@@ -764,18 +858,24 @@ jobs:
             esac
           }
 
-          changed_files_file="$RUNNER_TEMP/bbr3-changed-files"
-          if ! git diff --name-only "$merge_base" "$bbr3_tip" \
-            > "$changed_files_file"; then
-            echo "::error::Could not inspect the BBRv3 patch file list"
-            exit 1
-          fi
-          while IFS= read -r changed_file; do
-            if ! allowed_bbr3_file "$changed_file"; then
-              echo "::error::Unexpected file in BBRv3 patch: $changed_file"
+          for commit in "${bbr3_commits[@]}"; do
+            changed_files_file="$RUNNER_TEMP/bbr3-changed-files-${commit}"
+            if ! git diff-tree \
+              --no-commit-id \
+              --name-only \
+              -r \
+              "$commit" \
+              > "$changed_files_file"; then
+              echo "::error::Could not inspect BBRv3 commit $commit"
               exit 1
             fi
-          done < "$changed_files_file"
+            while IFS= read -r changed_file; do
+              if ! allowed_bbr3_file "$changed_file"; then
+                echo "::error::Unexpected file in BBRv3 commit $commit: $changed_file"
+                exit 1
+              fi
+            done < "$changed_files_file"
+          done
 
           git config user.name "Kernel Builder"
           git config user.email "kernel-builder@users.noreply.github.com"
@@ -829,10 +929,6 @@ jobs:
             "$GITHUB_WORKSPACE/config.cloud" \
             "$GITHUB_WORKSPACE/config.cloud-amd64" \
             "$GITHUB_WORKSPACE/config.vps"
-
-          # A localversion file is consumed by every Kbuild invocation,
-          # including the recursive make calls used by bindeb-pkg.
-          printf '%s\n' '-shouyu' > localversion-shouyu
 
           KCONFIG_WARN_UNKNOWN_SYMBOLS=1 \
           KCONFIG_WARN_CHANGED_INPUT=1 \
@@ -975,8 +1071,8 @@ jobs:
           check_not_enabled GDB_SCRIPTS
           check_not_enabled LOCKDEP
           check_not_enabled DEFAULT_BBR3
-          [[ "$(cat localversion-shouyu)" == "-shouyu" ]] || {
-            echo "::error::localversion-shouyu is invalid"
+          [[ "$LOCALVERSION" == "-shouyu" ]] || {
+            echo "::error::LOCALVERSION is invalid"
             fail=1
           }
 
@@ -991,8 +1087,9 @@ jobs:
           set -euxo pipefail
           cd /tmp/linux
           KREL="$(make -s kernelrelease)"
-          if [[ "$KREL" != *-shouyu ]]; then
-            echo "::error::Unexpected kernel release: $KREL"
+          expected="${{ needs.check.outputs.version }}-shouyu"
+          if [[ "$KREL" != "$expected" ]]; then
+            echo "::error::Expected kernel release $expected, got $KREL"
             exit 1
           fi
           fakeroot make -j"$(nproc)" bindeb-pkg \
