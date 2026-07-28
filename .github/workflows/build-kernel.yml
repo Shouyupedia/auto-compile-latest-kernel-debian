@@ -739,7 +739,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc kmod cpio flex libssl-dev libelf-dev bison \
+            build-essential bc kmod cpio flex libssl-dev libelf-dev libdw-dev bison \
             debhelper dpkg-dev rsync fakeroot xz-utils zstd
 
       - name: Download current kernel config snapshot
