@@ -858,9 +858,24 @@ jobs:
               fail=1
             fi
           }
+          kconfig_symbol_exists() {
+            git grep -qE \
+              "^[[:space:]]*(menu)?config[[:space:]]+$1([[:space:]]|$)" \
+              -- '*Kconfig*'
+          }
           check_disabled() {
             if ! grep -qxF "# CONFIG_$1 is not set" .config; then
               echo "::error::CONFIG_$1 must be disabled"
+              fail=1
+            fi
+          }
+          check_not_enabled() {
+            # Hidden or dependency-gated symbols may be omitted from .config.
+            if ! kconfig_symbol_exists "$1"; then
+              echo "::error::Unknown Kconfig symbol: CONFIG_$1"
+              fail=1
+            elif grep -qE "^CONFIG_$1=(y|m)$" .config; then
+              echo "::error::CONFIG_$1 must not be enabled"
               fail=1
             fi
           }
@@ -876,7 +891,18 @@ jobs:
               && ! "$requested_setting" =~ ^#\ CONFIG_[A-Z0-9_]+\ is\ not\ set$ ]]; then
               continue
             fi
-            if ! grep -qxF "$requested_setting" .config; then
+            if [[ "$requested_setting" =~ ^#\ CONFIG_([A-Z0-9_]+)\ is\ not\ set$ ]]; then
+              requested_symbol="${BASH_REMATCH[1]}"
+              if grep -qxF "$requested_setting" .config; then
+                continue
+              elif ! kconfig_symbol_exists "$requested_symbol"; then
+                echo "::error::Unknown overlay symbol: CONFIG_$requested_symbol"
+                fail=1
+              elif grep -q "^CONFIG_${requested_symbol}=" .config; then
+                echo "::error::Overlay request was not honored: $requested_setting"
+                fail=1
+              fi
+            elif ! grep -qxF "$requested_setting" .config; then
               echo "::error::Overlay request was not honored: $requested_setting"
               fail=1
             fi
@@ -941,11 +967,14 @@ jobs:
           check_value DEFAULT_TCP_CONG '"bbr"'
           check_value DEFAULT_NET_SCH '"fq"'
           check_disabled LOCALVERSION_AUTO
-          check_disabled DEFAULT_BBR3
           check_disabled MODULE_SIG_ALL
           check_disabled MODULE_SIG_FORCE
           check_disabled WERROR
-          check_disabled DEBUG_INFO
+          check_builtin DEBUG_INFO_NONE
+          check_not_enabled DEBUG_INFO
+          check_not_enabled GDB_SCRIPTS
+          check_not_enabled LOCKDEP
+          check_not_enabled DEFAULT_BBR3
           [[ "$(cat localversion-shouyu)" == "-shouyu" ]] || {
             echo "::error::localversion-shouyu is invalid"
             fail=1
