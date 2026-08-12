@@ -3,7 +3,8 @@ name: Build Debian Linux Kernel
 on:
   workflow_dispatch:
   schedule:
-    - cron: "28 10 * * *"
+    # GitHub schedules use UTC. Keep an off-peak minute and check every 3 hours.
+    - cron: "28 */3 * * *"
 
 permissions:
   contents: read
@@ -724,6 +725,51 @@ jobs:
       LOCALVERSION: "-shouyu"
 
     steps:
+      - name: Notify Telegram that the build started
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          SOURCE_TAG: ${{ needs.check.outputs.source_tag }}
+          TARGET_VERSION: ${{ needs.check.outputs.version }}-shouyu
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          request=(
+            --fail-with-body
+            --silent
+            --show-error
+            --connect-timeout 5
+            --max-time 20
+            --retry 2
+            --retry-delay 1
+            --retry-connrefused
+            --request POST
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID"
+          )
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            if ! [[ "$TELEGRAM_MESSAGE_THREAD_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::warning::TELEGRAM_MESSAGE_THREAD_ID must be a positive integer"
+              exit 0
+            fi
+            request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+          fi
+
+          message="$(printf \
+            '发现新的 Linux stable 内核：%s\n目标版本：%s\n状态：已开始编译\n运行记录：%s' \
+            "$SOURCE_TAG" "$TARGET_VERSION" "$RUN_URL")"
+          request+=(--data-urlencode "text=$message")
+          curl "${request[@]}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            > /dev/null
+
       - name: Free disk space
         run: |
           set -euxo pipefail
@@ -1502,3 +1548,124 @@ jobs:
           done
           [[ "$verified" == true ]] \
             || { echo "::error::Release verification failed"; exit 1; }
+
+  telegram-notify:
+    name: Notify Telegram of the result
+    needs:
+      - check
+      - build
+      - release
+    if: ${{ always() && needs.check.outputs.should_build == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+
+    steps:
+      - name: Notify successful release
+        if: >-
+          ${{
+            needs.check.result == 'success' &&
+            needs.build.result == 'success' &&
+            needs.release.result == 'success'
+          }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          KERNEL_RELEASE: ${{ needs.build.outputs.kernel_release }}
+          BUILD_TIME: ${{ needs.build.outputs.build_time }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.check.outputs.release_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          request=(
+            --fail-with-body
+            --silent
+            --show-error
+            --connect-timeout 5
+            --max-time 20
+            --retry 2
+            --retry-delay 1
+            --retry-connrefused
+            --request POST
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID"
+          )
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            if ! [[ "$TELEGRAM_MESSAGE_THREAD_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::warning::TELEGRAM_MESSAGE_THREAD_ID must be a positive integer"
+              exit 0
+            fi
+            request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+          fi
+
+          message="$(printf \
+            '内核编译并发布成功\n版本：%s\n构建时间：%s\nRelease：%s\n运行记录：%s' \
+            "$KERNEL_RELEASE" "$BUILD_TIME" "$RELEASE_URL" "$RUN_URL")"
+          request+=(--data-urlencode "text=$message")
+          curl "${request[@]}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            > /dev/null
+
+      - name: Notify failed build or release
+        if: >-
+          ${{
+            always() &&
+            (
+              needs.check.result != 'success' ||
+              needs.build.result != 'success' ||
+              needs.release.result != 'success'
+            )
+          }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          TARGET_VERSION: ${{ needs.check.outputs.version }}-shouyu
+          CHECK_RESULT: ${{ needs.check.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          request=(
+            --fail-with-body
+            --silent
+            --show-error
+            --connect-timeout 5
+            --max-time 20
+            --retry 2
+            --retry-delay 1
+            --retry-connrefused
+            --request POST
+            --data-urlencode "chat_id=$TELEGRAM_CHAT_ID"
+          )
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            if ! [[ "$TELEGRAM_MESSAGE_THREAD_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::warning::TELEGRAM_MESSAGE_THREAD_ID must be a positive integer"
+              exit 0
+            fi
+            request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+          fi
+
+          message="$(printf \
+            '内核编译或发布失败\n目标版本：%s\n检查：%s\n编译：%s\n发布：%s\n运行记录：%s' \
+            "$TARGET_VERSION" "$CHECK_RESULT" "$BUILD_RESULT" \
+            "$RELEASE_RESULT" "$RUN_URL")"
+          request+=(--data-urlencode "text=$message")
+          curl "${request[@]}" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            > /dev/null
