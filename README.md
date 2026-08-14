@@ -3,24 +3,7 @@
 该项目每 3 小时检查 Linux stable 的最新正式版本，为 amd64 VPS 构建带 `-shouyu` 后缀的 Debian 内核包。
 
 - 上游内核源码版本没有变化时，只同步 Debian 配置并整理现有 Release，不安装构建依赖、不编译，也不重复创建 Release。
-- 配置严格按照 Debian 当前 `cloud-amd64` 的四层顺序生成，再叠加本项目的 `config.vps`。
-- 保留 KVM/QEMU、Xen、Hyper-V、VMware、NVMe，以及 AWS、Google Cloud、Azure 常见虚拟网卡。
-- 保留 Docker 所需的 cgroup、namespace、OverlayFS、iptables/nftables 和常见容器网络功能。
-- 移除桌面、声音、无线、蓝牙、媒体、RDMA、旧协议和重型内核调试功能，模块使用 Zstandard 压缩。
 - 同时提供 BBRv1（`bbr`）和 BBRv3（`bbr3`）；默认使用 BBRv1 与 FQ，BBRv3 作为可选模块。
-- Release 只发布内核镜像与匹配头文件，页面正文只显示版本和 UTC 构建时间。
-
-## 自动检查与 Telegram 通知
-
-GitHub Actions 在 UTC 时间每 3 小时的第 28 分钟检查一次上游。如果发现新的内核版本，会立即启动编译，并在开始编译及最终成功或失败时发送 Telegram 通知。上游没有更新时不发送通知。
-
-在仓库的 `Settings → Secrets and variables → Actions` 中配置：
-
-- `TELEGRAM_BOT_TOKEN`：Telegram BotFather 生成的 Bot Token。
-- `TELEGRAM_CHAT_ID`：接收通知的用户、群组或频道 Chat ID，群组 ID 可以是负数。
-- `TELEGRAM_MESSAGE_THREAD_ID`：可选，Telegram 论坛群的话题 ID。
-
-未配置前两项 Secrets 时会安全跳过通知，不影响内核检查、编译或发布。GitHub 定时任务使用 UTC，并可能因平台负载稍有延迟。
 
 ## 安装
 
@@ -69,10 +52,3 @@ sudo sysctl --system
 ```bash
 sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
 ```
-
-## 兼容性边界
-
-- 目标是常见云 VPS，不包含桌面、本地无线/音频设备、RDMA/HPC 或裸机 RAID 的完整驱动集合。
-- 内核和模块未签名，因此不支持 Secure Boot/Trusted Launch。
-- 内核保留普通 BPF 与 Docker 支持，但为缩小体积关闭了调试信息和 BTF；依赖 BPF CO-RE/BTF 的工具不在兼容范围内。
-- 最大支持 256 个逻辑 CPU。
