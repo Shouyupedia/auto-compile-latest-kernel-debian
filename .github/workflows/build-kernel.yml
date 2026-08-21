@@ -181,7 +181,11 @@ jobs:
             exit 1
           fi
 
-          version="${latest_tag#v}"
+          source_version="${latest_tag#v}"
+          version="$source_version"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            version="${version}.0"
+          fi
           release_tag="v${version}-shouyu"
           existing_release=""
           existing_kernel_release=""
@@ -223,10 +227,16 @@ jobs:
             elif [[ "$published_tag" == "$latest_tag" ]]; then
               matches_source=true
               package_release="$version"
-            elif [[ "$published_tag" =~ ^v([0-9]+\.[0-9]+(\.[0-9]+)?)(-(shouyu|cloud))?-[0-9]+$ ]] \
-              && [[ "${BASH_REMATCH[1]}" == "$version" ]]; then
-              matches_source=true
-              package_release="$version${BASH_REMATCH[3]}"
+            elif [[ "$published_tag" =~ ^v([0-9]+\.[0-9]+(\.[0-9]+)?)(-(shouyu|cloud))?-[0-9]+$ ]]; then
+              published_version="${BASH_REMATCH[1]}"
+              published_suffix="${BASH_REMATCH[3]}"
+              if [[ "$published_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+                published_version="${published_version}.0"
+              fi
+              if [[ "$published_version" == "$version" ]]; then
+                matches_source=true
+                package_release="$version$published_suffix"
+              fi
             fi
 
             [[ "$matches_source" == true ]] || continue
@@ -745,7 +755,6 @@ jobs:
           request=(
             --fail-with-body
             --silent
-            --show-error
             --connect-timeout 5
             --max-time 20
             --retry 2
@@ -759,16 +768,33 @@ jobs:
               echo "::warning::TELEGRAM_MESSAGE_THREAD_ID must be a positive integer"
               exit 0
             fi
-            request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
           fi
 
           message="$(printf \
             '发现新的 Linux stable 内核：%s\n目标版本：%s\n状态：已开始编译\n运行记录：%s' \
             "$SOURCE_TAG" "$TARGET_VERSION" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
-          curl "${request[@]}" \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            > /dev/null
+          send_request=("${request[@]}")
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            send_request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+          fi
+
+          response="$RUNNER_TEMP/telegram-response.json"
+          telegram_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+          if curl "${send_request[@]}" --output "$response" "$telegram_url"; then
+            exit 0
+          fi
+
+          description="$(jq -r '.description // empty' "$response" 2>/dev/null || true)"
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            echo "::warning::Telegram topic notification failed: ${description:-no API description}; retrying without message_thread_id"
+            if curl "${request[@]}" --output "$response" "$telegram_url"; then
+              exit 0
+            fi
+            description="$(jq -r '.description // empty' "$response" 2>/dev/null || true)"
+          fi
+          echo "::warning::Telegram notification failed: ${description:-no API description}"
+          exit 0
 
       - name: Free disk space
         run: |
@@ -1588,7 +1614,6 @@ jobs:
           request=(
             --fail-with-body
             --silent
-            --show-error
             --connect-timeout 5
             --max-time 20
             --retry 2
@@ -1602,16 +1627,33 @@ jobs:
               echo "::warning::TELEGRAM_MESSAGE_THREAD_ID must be a positive integer"
               exit 0
             fi
-            request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
           fi
 
           message="$(printf \
             '内核编译并发布成功\n版本：%s\n构建时间：%s\nRelease：%s\n运行记录：%s' \
             "$KERNEL_RELEASE" "$BUILD_TIME" "$RELEASE_URL" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
-          curl "${request[@]}" \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            > /dev/null
+          send_request=("${request[@]}")
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            send_request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+          fi
+
+          response="$RUNNER_TEMP/telegram-response.json"
+          telegram_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+          if curl "${send_request[@]}" --output "$response" "$telegram_url"; then
+            exit 0
+          fi
+
+          description="$(jq -r '.description // empty' "$response" 2>/dev/null || true)"
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            echo "::warning::Telegram topic notification failed: ${description:-no API description}; retrying without message_thread_id"
+            if curl "${request[@]}" --output "$response" "$telegram_url"; then
+              exit 0
+            fi
+            description="$(jq -r '.description // empty' "$response" 2>/dev/null || true)"
+          fi
+          echo "::warning::Telegram notification failed: ${description:-no API description}"
+          exit 0
 
       - name: Notify failed build or release
         if: >-
@@ -1644,7 +1686,6 @@ jobs:
           request=(
             --fail-with-body
             --silent
-            --show-error
             --connect-timeout 5
             --max-time 20
             --retry 2
@@ -1658,7 +1699,6 @@ jobs:
               echo "::warning::TELEGRAM_MESSAGE_THREAD_ID must be a positive integer"
               exit 0
             fi
-            request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
           fi
 
           message="$(printf \
@@ -1666,6 +1706,24 @@ jobs:
             "$TARGET_VERSION" "$CHECK_RESULT" "$BUILD_RESULT" \
             "$RELEASE_RESULT" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
-          curl "${request[@]}" \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            > /dev/null
+          send_request=("${request[@]}")
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            send_request+=(--data-urlencode "message_thread_id=$TELEGRAM_MESSAGE_THREAD_ID")
+          fi
+
+          response="$RUNNER_TEMP/telegram-response.json"
+          telegram_url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+          if curl "${send_request[@]}" --output "$response" "$telegram_url"; then
+            exit 0
+          fi
+
+          description="$(jq -r '.description // empty' "$response" 2>/dev/null || true)"
+          if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
+            echo "::warning::Telegram topic notification failed: ${description:-no API description}; retrying without message_thread_id"
+            if curl "${request[@]}" --output "$response" "$telegram_url"; then
+              exit 0
+            fi
+            description="$(jq -r '.description // empty' "$response" 2>/dev/null || true)"
+          fi
+          echo "::warning::Telegram notification failed: ${description:-no API description}"
+          exit 0
