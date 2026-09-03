@@ -126,7 +126,35 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add config.cloud config.cloud-amd64
             git commit -m "chore: update Debian cloud kernel configs [skip ci]"
-            git push origin "HEAD:${DEFAULT_BRANCH}"
+            # A concurrent push to the default branch must not fail the whole
+            # scheduled run. actions/checkout is shallow, so a rebase is not
+            # possible; reset onto the current remote tip and re-apply the two
+            # config files instead.
+            pushed=false
+            for attempt in 1 2 3; do
+              if git push origin "HEAD:${DEFAULT_BRANCH}"; then
+                pushed=true
+                break
+              fi
+              echo "::warning::Config push attempt ${attempt} failed; re-applying onto ${DEFAULT_BRANCH}"
+              sleep "$((attempt * 3))"
+              git fetch --depth=1 origin "$DEFAULT_BRANCH"
+              git reset --hard FETCH_HEAD
+              install -m 0644 "$common_config" "$GITHUB_WORKSPACE/config.cloud"
+              install -m 0644 "$amd64_config" "$GITHUB_WORKSPACE/config.cloud-amd64"
+              if git diff --quiet -- config.cloud config.cloud-amd64; then
+                echo "Debian cloud configs were already updated by a concurrent run."
+                pushed=true
+                configs_changed=false
+                break
+              fi
+              git add config.cloud config.cloud-amd64
+              git commit -m "chore: update Debian cloud kernel configs [skip ci]"
+            done
+            if [[ "$pushed" != true ]]; then
+              echo "::error::Could not push the updated Debian cloud configs"
+              exit 1
+            fi
           else
             echo "Debian cloud configs are already up to date."
           fi
@@ -327,6 +355,41 @@ jobs:
             exit 1
           fi
 
+          # Supply-chain gate: only a tip that a maintainer has reviewed and
+          # recorded in bbr3-pin.txt may be built. CachyOS force-pushes these
+          # topic branches, so without this anchor any upstream move would ship
+          # to every user within three hours with nobody having looked at it.
+          pin_file="$GITHUB_WORKSPACE/bbr3-pin.txt"
+          if [[ ! -s "$pin_file" ]]; then
+            echo "::error::Missing BBRv3 pin file: bbr3-pin.txt"
+            exit 1
+          fi
+          pinned_tip=""
+          pin_branch=""
+          while read -r pin_branch pin_sha _ || [[ -n "$pin_branch" ]]; do
+            # Tolerate a CRLF pin file edited on Windows.
+            pin_branch="${pin_branch%$'\r'}"
+            pin_sha="${pin_sha:-}"
+            pin_sha="${pin_sha%$'\r'}"
+            [[ -n "$pin_branch" ]] || continue
+            [[ "$pin_branch" != \#* ]] || continue
+            if [[ "$pin_branch" == "$branch" ]]; then
+              pinned_tip="${pin_sha:-}"
+              break
+            fi
+          done < "$pin_file"
+
+          bbr3_web="${BBR3_REPO%.git}"
+          if ! [[ "$pinned_tip" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::bbr3-pin.txt has no reviewed pin for ${branch}. Review ${bbr3_web}/commits/${branch} and add the line '${branch} ${tip}' to bbr3-pin.txt."
+            exit 1
+          fi
+          if [[ "$pinned_tip" != "$tip" ]]; then
+            echo "::error::BBRv3 branch ${branch} moved past the reviewed pin. Review ${bbr3_web}/compare/${pinned_tip}...${tip} and, once the diff is confirmed to be BBRv3-only, update bbr3-pin.txt to '${branch} ${tip}'."
+            exit 1
+          fi
+          echo "BBRv3 topic tip matches the reviewed pin: $pinned_tip"
+
           # Compare the topic tip with the matching mainline release through
           # GitHub's API. This pins the short, unique topic chain without
           # downloading thousands of unrelated commits from both repositories.
@@ -428,6 +491,7 @@ jobs:
             echo "### BBRv3 source"
             echo
             echo "- Branch: \`$branch\`"
+            echo "- Reviewed pin: \`${pinned_tip:0:12}\`"
             echo "- Topic base: \`${base:0:12}\`"
             echo "- Topic commits: \`$commit_count\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -713,7 +777,7 @@ jobs:
               verified=true
               break
             fi
-            sleep 2
+            sleep "$((attempt * 2))"
           done
           [[ "$verified" == true ]] \
             || { echo "::error::Normalized Release verification failed"; exit 1; }
@@ -841,6 +905,10 @@ jobs:
           set -euo pipefail
           cd /tmp/linux
 
+          # The pristine stable tree, before any cherry-pick, is the baseline
+          # the applied series is diffed against below.
+          pristine_commit="$(git rev-parse HEAD)"
+
           bbr3_branch="${{ needs.check.outputs.bbr3_branch }}"
           expected_base="${{ needs.check.outputs.bbr3_base }}"
           expected_commit_count="${{ needs.check.outputs.bbr3_commit_count }}"
@@ -858,19 +926,34 @@ jobs:
           fi
 
           # The check job has already pinned and validated the linear topic
-          # chain. Fetch only that chain plus its base instead of deepening two
-          # repositories until their distant common ancestor becomes visible.
+          # chain. Fetch that short chain plus its base with all referenced
+          # objects -- deliberately NOT --filter. A partial fetch would make
+          # this a promisor remote, and cherry-pick would then lazily ask
+          # upload-pack for individual blobs by SHA. CachyOS force-pushes these
+          # topic branches, so those objects can already be unreachable and the
+          # lazy fetch dies with "upload-pack: not our ref".
           git remote add cachyos "$BBR3_REPO"
-          git fetch \
-            --no-tags \
-            --filter=blob:none \
-            --depth="$((expected_commit_count + 1))" \
-            cachyos \
-            "$bbr3_branch"
+          fetched=false
+          for attempt in 1 2 3; do
+            if git fetch \
+              --no-tags \
+              --depth="$((expected_commit_count + 1))" \
+              cachyos \
+              "$bbr3_branch"; then
+              fetched=true
+              break
+            fi
+            echo "::warning::BBRv3 fetch attempt ${attempt} failed; retrying"
+            sleep "$((attempt * 5))"
+          done
+          if [[ "$fetched" != true ]]; then
+            echo "::error::Could not fetch the BBRv3 topic branch $bbr3_branch"
+            exit 1
+          fi
 
           bbr3_tip="$(git rev-parse FETCH_HEAD)"
           if [[ "$bbr3_tip" != "$expected_tip" ]]; then
-            echo "::error::BBRv3 branch moved: expected $expected_tip, got $bbr3_tip"
+            echo "::error::BBRv3 branch moved during this run: expected $expected_tip, got $bbr3_tip. Re-run the workflow to re-pin the topic branch."
             exit 1
           fi
 
@@ -954,6 +1037,23 @@ jobs:
           for commit in "${bbr3_commits[@]}"; do
             git cherry-pick "$commit"
           done
+
+          # net/ipv4/Makefile is a GNU make file that kbuild parses on every
+          # build, and $(shell ...) inside it runs at parse time. The file has
+          # to stay in the allowlist for the obj-* line the series needs, so
+          # constrain its shape instead: additions only, and only plain obj-*.
+          makefile_diff="$RUNNER_TEMP/bbr3-makefile.diff"
+          git diff "$pristine_commit" -- net/ipv4/Makefile > "$makefile_diff"
+          if grep -qE '^-[^-]' "$makefile_diff"; then
+            echo "::error::The BBRv3 series removes lines from net/ipv4/Makefile"
+            exit 1
+          fi
+          while IFS= read -r added_line; do
+            if ! [[ "$added_line" =~ ^\+obj-\$\(CONFIG_[A-Z0-9_]+\)[[:space:]]*\+=[[:space:]]*[A-Za-z0-9_-]+\.o$ ]]; then
+              echo "::error::Unexpected net/ipv4/Makefile addition: ${added_line#+}"
+              exit 1
+            fi
+          done < <(grep -E '^\+[^+]' "$makefile_diff" || true)
 
           grep -q '^config TCP_CONG_BBR3$' net/ipv4/Kconfig
           grep -Fq 'obj-$(CONFIG_TCP_CONG_BBR3) += tcp_bbr3.o' net/ipv4/Makefile
@@ -1570,7 +1670,7 @@ jobs:
               verified=true
               break
             fi
-            sleep 2
+            sleep "$((attempt * 2))"
           done
           [[ "$verified" == true ]] \
             || { echo "::error::Release verification failed"; exit 1; }
